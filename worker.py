@@ -11,17 +11,17 @@ from google import genai
 from google.genai import types
 
 # ================= INPUTS & SECRETS =================
-API_ID = int(os.getenv("TG_API_ID", "2040"))
-API_HASH = os.getenv("TG_API_HASH", "b18441a1ff607e10a989891a5462e627")
+API_ID = int(os.getenv("TG_API_ID") or "2040")
+API_HASH = os.getenv("TG_API_HASH") or "b18441a1ff607e10a989891a5462e627"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-CHAT_ID = int(os.getenv("CHAT_ID"))
-STATUS_MSG_ID = int(os.getenv("STATUS_MSG_ID"))
-VIDEO_MSG_ID = int(os.getenv("VIDEO_MSG_ID"))
-THUMB_MSG_ID = int(os.getenv("THUMB_MSG_ID", "0"))
-USER_TAG = os.getenv("USER_TAG", "@YourChannelTag")
+CHAT_ID = int(os.getenv("CHAT_ID") or "0")
+STATUS_MSG_ID = int(os.getenv("STATUS_MSG_ID") or "0")
+VIDEO_MSG_ID = int(os.getenv("VIDEO_MSG_ID") or "0")
+THUMB_MSG_ID = int(os.getenv("THUMB_MSG_ID") or "0")
+USER_TAG = os.getenv("USER_TAG") or "@YourChannelTag"
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
