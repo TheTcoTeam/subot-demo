@@ -23,35 +23,25 @@ on:
 jobs:
   render-subtitles:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Install FFmpeg & Persian Font Shaping Libraries
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg libass-dev libfreetype6-dev libfribidi-dev libharfbuzz-dev wget unzip
-
-      - name: Download Vazirmatn Persian Font
-        run: |
-          mkdir -p fonts
-          wget -q -O fonts/Vazirmatn-Bold.ttf https://github.com/rastikerdar/vazirmatn/raw/master/fonts/ttf/Vazirmatn-Bold.ttf
-          wget -q -O fonts/Vazirmatn-Regular.ttf https://github.com/rastikerdar/vazirmatn/raw/master/fonts/ttf/Vazirmatn-Regular.ttf
-          sudo cp fonts/*.ttf /usr/share/fonts/truetype/
-          sudo fc-cache -f -v
-
-      - name: Set up Python 3.11
+      - name: Set up Python 3.11 (Cached)
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Install Dependencies
+      - name: Install Dependencies & Font
         run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
+          mkdir -p fonts
+          if [ ! -f fonts/Vazirmatn-Bold.ttf ]; then
+            wget -q -O fonts/Vazirmatn-Bold.ttf https://github.com/rastikerdar/vazirmatn/raw/master/fonts/ttf/Vazirmatn-Bold.ttf
+          fi
+          pip install -q -r requirements.txt
 
       - name: Run Video Subtitle Worker
         env:
