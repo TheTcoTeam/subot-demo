@@ -11,11 +11,11 @@ from google import genai
 from google.genai import types
 
 # ================= INPUTS & SECRETS =================
-API_ID = int(os.getenv("TG_API_ID") or "2040")
-API_HASH = os.getenv("TG_API_HASH") or "b18441a1ff607e10a989891a5462e627"
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+API_ID = int((os.getenv("TG_API_ID") or "2040").strip())
+API_HASH = (os.getenv("TG_API_HASH") or "b18441a1ff607e10a989891a5462e627").strip()
+BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
+GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or "").strip()
+GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
 
 CHAT_ID = int(os.getenv("CHAT_ID") or "0")
 STATUS_MSG_ID = int(os.getenv("STATUS_MSG_ID") or "0")
