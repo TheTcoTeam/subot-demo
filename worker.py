@@ -108,7 +108,7 @@ def translate_segments_to_persian(segments: list[dict]) -> list[dict]:
         return []
 
     translated_all = []
-    batch_size = 35  # Safe batch size for long videos
+    batch_size = 35
 
     system_instruction = (
         "You are an expert Iranian movie and social media subtitle translator. "
@@ -117,7 +117,8 @@ def translate_segments_to_persian(segments: list[dict]) -> list[dict]:
         "Rules:\n"
         "1. Keep each Persian line concise so it reads smoothly as a video subtitle.\n"
         "2. Translate idioms and slang naturally into Persian equivalents, NEVER word-for-word robotic translation.\n"
-        "3. Return ONLY a valid JSON array of objects with the exact same 'id' and a 'fa' field containing the Persian translation."
+        "3. Return ONLY a valid JSON object with a single key 'translations' containing the array of objects "
+        "with the exact same 'id' and a 'fa' field containing the Persian translation."
     )
 
     for i in range(0, len(segments), batch_size):
@@ -127,18 +128,40 @@ def translate_segments_to_persian(segments: list[dict]) -> list[dict]:
             ensure_ascii=False
         )
 
-        response = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt_payload,
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                response_mime_type="application/json",
+        raw_json_text = None
+
+        # 1. Try Gemini 3.8 Flash first
+        if GEMINI_API_KEY:
+            try:
+                response = gemini_client.models.generate_content(
+                    model="gemini-3.8-flash",
+                    contents=prompt_payload,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                        response_mime_type="application/json",
+                        temperature=0.2
+                    )
+                )
+                raw_json_text = response.text
+            except Exception as gemini_err:
+                print(f"Gemini error, falling back to Groq LLM: {gemini_err}")
+
+        # 2. Automatic Fallback to Groq (Llama 3.3 70B) if Gemini fails
+        if not raw_json_text:
+            chat_completion = groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "system", "content": system_instruction},
+                    {"role": "user", "content": prompt_payload}
+                ],
+                response_format={"type": "json_object"},
                 temperature=0.2
             )
-        )
+            raw_json_text = chat_completion.choices[0].message.content
 
         try:
-            fa_list = json.loads(response.text)
+            parsed = json.loads(raw_json_text)
+            fa_list = parsed.get("translations", parsed) if isinstance(parsed, dict) else parsed
             fa_map = {int(item["id"]): item["fa"] for item in fa_list if "id" in item and "fa" in item}
         except Exception as e:
             print(f"JSON parse fallback on batch {i}: {e}")
