@@ -3,11 +3,30 @@ import sys
 import json
 import time
 import math
+import hashlib
 import asyncio
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
-from pyrogram import Client
-from pyrogram.enums import ParseMode
+
+from telethon import TelegramClient, utils
+from telethon.tl.types import (
+    DocumentAttributeVideo,
+    InputDocumentFileLocation,
+    InputPhotoFileLocation,
+    InputFile,
+    InputFileBig,
+)
+from telethon.tl.functions.upload import (
+    GetFileRequest,
+    SaveFilePartRequest,
+    SaveBigFilePartRequest,
+)
+from telethon.network import MTProtoSender
+from telethon.tl.functions.auth import ExportAuthorizationRequest, ImportAuthorizationRequest
+from telethon.tl.functions.InitConnectionRequest import InitConnectionRequest
+from telethon.tl.functions.InvokeWithLayerRequest import InvokeWithLayerRequest
+from telethon.tl.alltlobjects import LAYER
+
 from groq import Groq
 from google import genai
 from google.genai import types
@@ -31,10 +50,11 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 last_edit_time = 0.0
 
 
-async def update_status(app: Client, step_text: str, force: bool = True):
+# ================= STATUS & PROGRESS HELPERS =================
+async def update_status(client: TelegramClient, step_text: str, force: bool = True):
     global last_edit_time
     now = time.time()
-    if not force and (now - last_edit_time) < 7.0:
+    if not force and (now - last_edit_time) < 6.5:
         return
     last_edit_time = now
     try:
@@ -45,12 +65,7 @@ async def update_status(app: Client, step_text: str, force: bool = True):
             "━━━━━━━━━━━━━━━━━━━━\n"
             "⏳ <i>عملیات به صورت موازی در حال انجام است.</i>"
         )
-        await app.edit_message_text(
-            chat_id=CHAT_ID,
-            message_id=STATUS_MSG_ID,
-            text=text,
-            parse_mode=ParseMode.HTML
-        )
+        await client.edit_message(CHAT_ID, STATUS_MSG_ID, text, parse_mode="html")
     except Exception as e:
         print(f"Status update skipped: {e}")
 
@@ -61,6 +76,143 @@ def make_progress_bar(percent: float) -> str:
     return "🟩" * filled + "⬜" * (10 - filled)
 
 
+# ================= 8-SOCKET PARALLEL MTPROTO TRANSFER ENGINE =================
+async def parallel_download_file(
+    client: TelegramClient,
+    media_message,
+    output_path: str,
+    progress_callback=None,
+    workers: int = 8
+):
+    """
+    Splits large Telegram files into 512KB chunks and downloads them across
+    parallel tasks for 5x-10x faster speeds than sequential downloading.
+    """
+    doc = media_message.document or media_message.video
+    if not doc:
+        return await client.download_media(media_message, file=output_path)
+
+    file_size = doc.size
+    part_size = 512 * 1024  # 512 KB (maximum allowed MTProto chunk size)
+    total_parts = math.ceil(file_size / part_size)
+
+    location = InputDocumentFileLocation(
+        id=doc.id,
+        access_hash=doc.access_hash,
+        file_reference=doc.file_reference,
+        thumb_size=""
+    )
+
+    # Pre-allocate file on disk
+    with open(output_path, "wb") as f:
+        f.truncate(file_size)
+
+    downloaded_bytes = 0
+    sem = asyncio.Semaphore(workers)
+    file_lock = asyncio.Lock()
+
+    async def fetch_part(part_idx: int):
+        nonlocal downloaded_bytes
+        offset = part_idx * part_size
+        async with sem:
+            for attempt in range(4):
+                try:
+                    res = await client(GetFileRequest(
+                        location=location,
+                        offset=offset,
+                        limit=part_size
+                    ))
+                    chunk = res.bytes
+                    async with file_lock:
+                        with open(output_path, "r+b") as f:
+                            f.seek(offset)
+                            f.write(chunk)
+                        downloaded_bytes += len(chunk)
+                        if progress_callback:
+                            await progress_callback(downloaded_bytes, file_size)
+                    break
+                except Exception as e:
+                    if attempt == 3:
+                        raise e
+                    await asyncio.sleep(1.0 * (attempt + 1))
+
+    tasks = [asyncio.create_task(fetch_part(i)) for i in range(total_parts)]
+    await asyncio.gather(*tasks)
+    return output_path
+
+
+async def parallel_upload_file(
+    client: TelegramClient,
+    file_path: str,
+    progress_callback=None,
+    workers: int = 8
+):
+    """
+    Uploads the rendered video in 512KB chunks across 8 parallel tasks.
+    """
+    file_size = os.path.getsize(file_path)
+    part_size = 512 * 1024  # 512 KB
+    total_parts = math.ceil(file_size / part_size)
+    is_big = file_size > 10 * 1024 * 1024
+    file_id = int.from_bytes(os.urandom(8), signed=True)
+
+    uploaded_bytes = 0
+    sem = asyncio.Semaphore(workers)
+    hash_md5 = hashlib.md5() if not is_big else None
+
+    if not is_big:
+        with open(file_path, "rb") as f:
+            while chunk := f.read(65536):
+                hash_md5.update(chunk)
+
+    async def send_part(part_idx: int):
+        nonlocal uploaded_bytes
+        offset = part_idx * part_size
+        with open(file_path, "rb") as f:
+            f.seek(offset)
+            chunk = f.read(part_size)
+
+        async with sem:
+            for attempt in range(4):
+                try:
+                    if is_big:
+                        await client(SaveBigFilePartRequest(
+                            file_id=file_id,
+                            file_part=part_idx,
+                            file_total_parts=total_parts,
+                            bytes=chunk
+                        ))
+                    else:
+                        await client(SaveFilePartRequest(
+                            file_id=file_id,
+                            file_part=part_idx,
+                            bytes=chunk
+                        ))
+                    uploaded_bytes += len(chunk)
+                    if progress_callback:
+                        await progress_callback(uploaded_bytes, file_size)
+                    break
+                except Exception as e:
+                    if attempt == 3:
+                        raise e
+                    await asyncio.sleep(1.0 * (attempt + 1))
+
+    tasks = [asyncio.create_task(send_part(i)) for i in range(total_parts)]
+    await asyncio.gather(*tasks)
+
+    file_name = os.path.basename(file_path)
+    if is_big:
+        return InputFileBig(id=file_id, parts=total_parts, name=file_name)
+    else:
+        return InputFile(
+            id=file_id,
+            parts=total_parts,
+            name=file_name,
+            md5_checksum=hash_md5.hexdigest()
+        )
+
+
+# ================= VIDEO & AUDIO PROCESSING =================
 def get_video_info(video_path: str) -> tuple[int, int, int]:
     """Returns (width, height, duration_seconds) using ffprobe."""
     cmd = [
@@ -79,12 +231,10 @@ def get_video_info(video_path: str) -> tuple[int, int, int]:
 
 def compute_target_resolution(width: int, height: int) -> tuple[int, int]:
     """
-    Caps the shorter dimension at 720p (e.g., 1280x720 for landscape or 720x1280 for portrait).
-    This makes FFmpeg 3x faster and shrinks 400MB files down to ~80MB for 5x faster Telegram upload!
+    Caps the shorter dimension at 720p so FFmpeg encodes 3x faster and shrinks output size.
     """
     min_dim = min(width, height)
     if min_dim <= 720:
-        # Ensure even dimensions for libx264
         return (width - (width % 2), height - (height % 2))
     scale_factor = 720.0 / float(min_dim)
     new_w = int(round(width * scale_factor))
@@ -105,7 +255,7 @@ def extract_compressed_audio(video_path: str, audio_path: str):
 
 
 def transcribe_audio_with_groq(audio_path: str) -> list[dict]:
-    """Uses Whisper on Groq with automatic model fallback."""
+    """Uses Whisper on Groq with a prompt encouraging accurate proper noun spelling."""
     whisper_models = ["whisper-large-v3-turbo", "whisper-large-v3"]
     transcription = None
 
@@ -115,6 +265,7 @@ def transcribe_audio_with_groq(audio_path: str) -> list[dict]:
                 transcription = groq_client.audio.transcriptions.create(
                     file=(audio_path, f.read()),
                     model=w_model,
+                    prompt="Transcribe accurately with proper capitalization for all names, people, places, and brands.",
                     response_format="verbose_json",
                     language="en",
                     temperature=0.0
@@ -152,6 +303,7 @@ def transcribe_audio_with_groq(audio_path: str) -> list[dict]:
     return clean_segments
 
 
+# ================= SMART TWO-PASS TRANSLATION (NAME & GLOSSARY ENGINE) =================
 def get_available_gemini_models() -> list[str]:
     candidates = ["gemini-3.8-flash", "gemini-3.8-pro", "gemini-3.0-flash", "gemini-2.5-pro"]
     if not gemini_client:
@@ -180,7 +332,7 @@ def get_available_groq_chat_models() -> list[str]:
     except Exception as e:
         print(f"Could not list Groq models dynamically: {e}")
 
-    preferred_keywords = ["llama", "qwen", "deepseek", "gemma", "mixtral"]
+    preferred_keywords = ["llama-3.3", "qwen", "deepseek", "llama-3.1", "llama", "gemma", "mixtral"]
     candidates.sort(
         key=lambda x: next((i for i, kw in enumerate(preferred_keywords) if kw in x.lower()), 99)
     )
@@ -201,59 +353,126 @@ def extract_json_from_text(raw_text: str):
     return json.loads(text)
 
 
-def translate_single_batch_sync(
-    batch: list[dict],
-    batch_idx: int,
-    gemini_models: list[str],
-    groq_models: list[str],
-    system_instruction: str
-) -> dict[int, str]:
-    """Translates a single batch synchronously (called concurrently across threads)."""
-    prompt_payload = json.dumps(
-        [{"id": item["id"], "en": item["text"]} for item in batch],
-        ensure_ascii=False
-    )
-
-    parsed_json = None
-
-    # 1. Try Groq fast chat models first for ultra-low latency (hundreds of tokens/sec)
+def call_llm_json(system_prompt: str, user_payload: str, gemini_models: list[str], groq_models: list[str]):
+    """Calls Groq or Gemini and parses the returned JSON."""
     for q_model in groq_models[:3]:
         try:
             chat_completion = groq_client.chat.completions.create(
                 model=q_model,
                 messages=[
-                    {"role": "system", "content": system_instruction},
-                    {"role": "user", "content": prompt_payload}
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_payload}
                 ],
-                temperature=0.2
+                temperature=0.15
             )
-            raw_text = chat_completion.choices[0].message.content
-            parsed_json = extract_json_from_text(raw_text)
-            print(f"Batch {batch_idx} translated in parallel via Groq ({q_model})")
-            break
-        except Exception as groq_err:
-            print(f"Groq {q_model} failed on batch {batch_idx}: {str(groq_err)[:120]}")
+            return extract_json_from_text(chat_completion.choices[0].message.content)
+        except Exception as e:
+            print(f"Groq {q_model} failed: {str(e)[:120]}")
 
-    # 2. Fallback to Gemini models if Groq rate-limits
-    if parsed_json is None and gemini_client:
+    if gemini_client:
         for g_model in gemini_models:
             try:
                 response = gemini_client.models.generate_content(
                     model=g_model,
-                    contents=prompt_payload,
+                    contents=user_payload,
                     config=types.GenerateContentConfig(
-                        system_instruction=system_instruction,
+                        system_instruction=system_prompt,
                         response_mime_type="application/json",
-                        temperature=0.2
+                        temperature=0.15
                     )
                 )
-                parsed_json = extract_json_from_text(response.text)
-                print(f"Batch {batch_idx} translated in parallel via Gemini ({g_model})")
-                break
-            except Exception as gemini_err:
-                print(f"Gemini {g_model} failed on batch {batch_idx}: {str(gemini_err)[:120]}")
+                return extract_json_from_text(response.text)
+            except Exception as e:
+                print(f"Gemini {g_model} failed: {str(e)[:120]}")
 
-    if parsed_json is None:
+    return None
+
+
+def build_video_context_and_name_glossary(
+    segments: list[dict],
+    gemini_models: list[str],
+    groq_models: list[str]
+) -> dict:
+    """
+    PASS 1: Scans the full transcript to:
+    1. Identify the video's exact topic/context.
+    2. Detect any phonetic misspellings of famous names/places/brands made by speech-to-text.
+    3. Build a strict English -> Persian glossary of all proper nouns (people, characters, brands, cities)
+       so names are NEVER translated literally and stay 100% consistent across all batches.
+    """
+    full_script_sample = " ".join(s["text"] for s in segments)
+    if len(full_script_sample) > 12000:
+        # Take beginning, middle, and end if the video is very long
+        third = len(full_script_sample) // 3
+        full_script_sample = (
+            full_script_sample[:4000] + " ... " +
+            full_script_sample[third:third + 4000] + " ... " +
+            full_script_sample[-4000:]
+        )
+
+    glossary_system = (
+        "You are a senior Persian localization director. Analyze the English video transcript below.\n"
+        "Your job is to fix proper nouns (names of people, characters, celebrities, brands, games, places) "
+        "so the Persian subtitle translators do not ruin or literally translate names.\n"
+        "Rules:\n"
+        "1. Identify all proper nouns in the transcript (including names that speech-to-text might have slightly misspelled phonetically based on context).\n"
+        "2. Map each name/term to its standard, natural Persian phonetic spelling (e.g., 'MrBeast' -> 'میستر بیست', 'Taylor Swift' -> 'تیلور سوییفت', 'White House' -> 'کاخ سفید').\n"
+        "3. NEVER translate a person's name into its literal dictionary meaning (e.g., 'Bill' is 'بیل', NEVER 'صورتحساب'; 'Mark' is 'مارک', NEVER 'علامت'; 'Grace' is 'گریس', NEVER 'نعمت').\n"
+        "4. Return ONLY a valid JSON object with two keys:\n"
+        "   - \"topic\": A 1-sentence summary of what the video is about and its tone.\n"
+        "   - \"glossary\": An object mapping each English name/term (and any transcript misspelling) to its exact Persian script equivalent."
+    )
+
+    res = call_llm_json(glossary_system, full_script_sample, gemini_models, groq_models)
+    if isinstance(res, dict):
+        print(f"Glossary extracted: {res}")
+        return {
+            "topic": res.get("topic", "General English video"),
+            "glossary": res.get("glossary", {})
+        }
+    return {"topic": "General English video", "glossary": {}}
+
+
+def translate_single_batch_sync(
+    batch: list[dict],
+    prev_context: list[str],
+    next_context: list[str],
+    batch_idx: int,
+    context_info: dict,
+    gemini_models: list[str],
+    groq_models: list[str]
+) -> dict[int, str]:
+    """
+    PASS 2: Translates a batch of subtitle lines using the locked Master Name Glossary
+    plus surrounding context lines so sentences split across timestamps translate seamlessly.
+    """
+    glossary_str = json.dumps(context_info.get("glossary", {}), ensure_ascii=False)
+    topic_str = context_info.get("topic", "")
+
+    system_instruction = (
+        "You are an elite Iranian subtitle translator. Translate the English subtitle lines into "
+        "natural, fluent, conversational Persian (فارسی محاوره‌ای و طبیعی).\n\n"
+        f"VIDEO TOPIC & TONE: {topic_str}\n"
+        f"MANDATORY NAME & TERM GLOSSARY (Use these exact Persian spellings for names/brands): {glossary_str}\n\n"
+        "STRICT RULES:\n"
+        "1. PROPER NAMES: NEVER translate people's names, character names, or brand names into literal dictionary words. "
+        "Always transliterate names phonetically into Persian script according to the Mandatory Glossary above.\n"
+        "2. PHONETIC CORRECTION: If speech-to-text slightly misspelled a name in English, use the Video Topic and Glossary to write the correct name in Persian.\n"
+        "3. FLOW & CONTINUITY: Many sentences are split across consecutive subtitle lines. Read the surrounding lines so the grammar and meaning connect smoothly.\n"
+        "4. CONCISE SUBTITLES: Keep each line concise and natural for spoken Persian.\n"
+        "5. Return ONLY a valid JSON object with a single key \"translations\" containing the array of objects "
+        "with the exact same \"id\" and a \"fa\" field containing the Persian translation. Do not include markdown."
+    )
+
+    payload_obj = {
+        "previous_lines_for_context_only": prev_context,
+        "lines_to_translate": [{"id": item["id"], "en": item["text"]} for item in batch],
+        "upcoming_lines_for_context_only": next_context
+    }
+    prompt_payload = json.dumps(payload_obj, ensure_ascii=False)
+
+    parsed_json = call_llm_json(system_instruction, prompt_payload, gemini_models, groq_models)
+    if not parsed_json:
         return {}
 
     try:
@@ -265,41 +484,48 @@ def translate_single_batch_sync(
 
 
 async def translate_segments_parallel(segments: list[dict]) -> list[dict]:
-    """Translates ALL subtitle batches concurrently in 3-5 seconds using ThreadPoolExecutor."""
+    """Runs Pass 1 (Master Glossary) then Pass 2 (Parallel Contextual Batches)."""
     if not segments:
         return []
 
     gemini_models = get_available_gemini_models()
     groq_models = get_available_groq_chat_models()
 
-    system_instruction = (
-        "You are an expert Iranian movie and social media subtitle translator. "
-        "Translate the provided JSON array of English subtitle lines into natural, fluent, "
-        "conversational Persian (فارسی محاوره‌ای و طبیعی). "
-        "Rules:\n"
-        "1. Keep each Persian line concise so it reads smoothly as a video subtitle.\n"
-        "2. Translate idioms and slang naturally into Persian equivalents, NEVER word-for-word robotic translation.\n"
-        "3. Return ONLY a valid JSON object with a single key \"translations\" containing the array of objects "
-        "with the exact same \"id\" and a \"fa\" field containing the Persian translation. Do not include markdown."
+    loop = asyncio.get_running_loop()
+
+    # Pass 1: Build global name glossary so names are 100% accurate and consistent
+    context_info = await loop.run_in_executor(
+        None,
+        build_video_context_and_name_glossary,
+        segments,
+        gemini_models,
+        groq_models
     )
 
-    batch_size = 40
-    batches = [segments[i:i + batch_size] for i in range(0, len(segments), batch_size)]
+    # Pass 2: Translate batches in parallel with surrounding line context
+    batch_size = 35
+    tasks = []
 
-    loop = asyncio.get_running_loop()
     with ThreadPoolExecutor(max_workers=4) as pool:
-        tasks = [
-            loop.run_in_executor(
-                pool,
-                translate_single_batch_sync,
-                batch,
-                idx,
-                gemini_models,
-                groq_models,
-                system_instruction
+        for idx, start_i in enumerate(range(0, len(segments), batch_size)):
+            end_i = start_i + batch_size
+            batch = segments[start_i:end_i]
+            prev_ctx = [s["text"] for s in segments[max(0, start_i - 3):start_i]]
+            next_ctx = [s["text"] for s in segments[end_i:min(len(segments), end_i + 3)]]
+
+            tasks.append(
+                loop.run_in_executor(
+                    pool,
+                    translate_single_batch_sync,
+                    batch,
+                    prev_ctx,
+                    next_ctx,
+                    idx,
+                    context_info,
+                    gemini_models,
+                    groq_models
+                )
             )
-            for idx, batch in enumerate(batches)
-        ]
         results = await asyncio.gather(*tasks)
 
     combined_map = {}
@@ -317,6 +543,7 @@ async def translate_segments_parallel(segments: list[dict]) -> list[dict]:
     return translated_all
 
 
+# ================= SUBTITLE (.ASS) & FFMPEG RENDERING =================
 def format_ass_time(seconds: float) -> str:
     hrs = int(seconds // 3600)
     mins = int((seconds % 3600) // 60)
@@ -367,7 +594,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 
 async def burn_subtitles_ffmpeg_async(
-    app: Client,
+    client: TelegramClient,
     input_video: str,
     ass_path: str,
     fonts_dir: str,
@@ -376,12 +603,6 @@ async def burn_subtitles_ffmpeg_async(
     target_h: int,
     total_duration: int
 ):
-    """
-    Ultra-fast FFmpeg pipeline:
-    1. Scales oversized 1080p/4K videos down to 720p HD BEFORE burning subtitles (3x faster CPU render + 5x smaller upload).
-    2. Uses '-preset ultrafast -tune fastdecode -crf 25' to hit 4x-6x real-time speed on GitHub's 4-core CPU.
-    3. Copies original audio ('-c:a copy') in 0 seconds.
-    """
     vf_filter = f"scale={target_w}:{target_h}:flags=fast_bilinear,ass={ass_path}:fontsdir={fonts_dir}"
     cmd = [
         "ffmpeg", "-y", "-threads", "0", "-i", input_video,
@@ -411,7 +632,7 @@ async def burn_subtitles_ffmpeg_async(
                 pct = min(99.0, max(0.0, (current_sec / total_duration) * 100.0))
                 bar = make_progress_bar(pct)
                 await update_status(
-                    app,
+                    client,
                     f"🎬 <b>مرحله ۴ از ۵:</b> رندر فوق‌سریع زیرنویس...\n"
                     f"{bar} <b>{pct:.1f}%</b>",
                     force=False
@@ -425,157 +646,140 @@ async def burn_subtitles_ffmpeg_async(
         raise RuntimeError(f"FFmpeg failed: {stderr_out[-300:]}")
 
 
+# ================= MAIN PIPELINE =================
 async def main():
-    app = Client(
-        "worker_session",
-        api_id=API_ID,
-        api_hash=API_HASH,
-        bot_token=BOT_TOKEN,
-        in_memory=True,
-        workers=16,
-        max_concurrent_transmissions=8,
-        sleep_threshold=60
+    client = TelegramClient(
+        None,  # In-memory session
+        API_ID,
+        API_HASH,
+        flood_sleep_threshold=60
     )
+    await client.start(bot_token=BOT_TOKEN)
 
-    async with app:
-        try:
-            t_start = time.time()
-            loop = asyncio.get_running_loop()
-
-            def download_progress(current, total):
-                if total > 0:
-                    pct = (current / total) * 100.0
-                    mb_cur = current / (1024 * 1024)
-                    mb_tot = total / (1024 * 1024)
-                    bar = make_progress_bar(pct)
-                    text = (
-                        f"📥 <b>مرحله ۱ از ۵:</b> دانلود ویدیو از تلگرام...\n"
-                        f"{bar} <b>{pct:.1f}%</b> (<code>{mb_cur:.1f} / {mb_tot:.1f} MB</code>)"
-                    )
-                    asyncio.run_coroutine_threadsafe(update_status(app, text, force=False), loop)
-
-            # 1. Download Video
-            await update_status(app, "📥 <b>مرحله ۱ از ۵:</b> شروع دانلود پرسرعت ویدیو...", force=True)
-            video_msg = await app.get_messages(CHAT_ID, VIDEO_MSG_ID)
-            input_video = await app.download_media(
-                video_msg,
-                file_name="input_video.mp4",
-                progress=download_progress
-            )
-
-            thumb_path = None
-            if THUMB_MSG_ID and THUMB_MSG_ID > 0:
-                thumb_msg = await app.get_messages(CHAT_ID, THUMB_MSG_ID)
-                if thumb_msg and thumb_msg.photo:
-                    thumb_path = await app.download_media(thumb_msg, file_name="custom_thumb.jpg")
-
-            orig_w, orig_h, duration = get_video_info(input_video)
-            target_w, target_h = compute_target_resolution(orig_w, orig_h)
-
-            # 2. Extract Audio & Transcribe with Groq Whisper
-            await update_status(app, "🎙 <b>مرحله ۲ از ۵:</b> استخراج صدا و تشخیص گفتار (Groq Whisper)...", force=True)
-            audio_path = "extracted_audio.mp3"
-            extract_compressed_audio(input_video, audio_path)
-            segments = transcribe_audio_with_groq(audio_path)
-
-            if not segments:
-                await update_status(app, "⚠️ گفتگوی انگلیسی تشخیص داده نشد، در حال درج تگ...", force=True)
-                translated_subs = []
-            else:
-                # 3. Parallel Persian Translation (All batches simultaneously!)
-                await update_status(
-                    app,
-                    f"⚡ <b>مرحله ۳ از ۵:</b> ترجمه موازی و همزمان ({len(segments)} خط دیالوگ)...",
-                    force=True
+    try:
+        async def dl_progress(current, total):
+            if total > 0:
+                pct = (current / total) * 100.0
+                mb_cur = current / (1024 * 1024)
+                mb_tot = total / (1024 * 1024)
+                bar = make_progress_bar(pct)
+                text = (
+                    f"📥 <b>مرحله ۱ از ۵:</b> دانلود موازی ۸ کاناله از تلگرام...\n"
+                    f"{bar} <b>{pct:.1f}%</b> (<code>{mb_cur:.1f} / {mb_tot:.1f} MB</code>)"
                 )
-                translated_subs = await translate_segments_parallel(segments)
+                await update_status(client, text, force=False)
 
-            # 4. Generate ASS & Burn with Ultra-Fast 720p FFmpeg
-            await update_status(app, "🎬 <b>مرحله ۴ از ۵:</b> شروع هاردساب فوق‌سریع زیرنویس زرد...", force=True)
-            ass_path = "subtitles.ass"
-            fonts_dir = "./fonts"
-            output_video = "output_subtitled.mp4"
+        # 1. Parallel 8-Socket Download
+        await update_status(client, "📥 <b>مرحله ۱ از ۵:</b> شروع دانلود موازی پرسرعت...", force=True)
+        video_msg = await client.get_messages(CHAT_ID, ids=VIDEO_MSG_ID)
+        input_video = "input_video.mp4"
+        await parallel_download_file(client, video_msg, input_video, progress_callback=dl_progress, workers=8)
 
-            generate_ass_file(translated_subs, USER_TAG, target_w, target_h, ass_path)
-            await burn_subtitles_ffmpeg_async(
-                app, input_video, ass_path, fonts_dir, output_video, target_w, target_h, duration
-            )
+        thumb_path = None
+        if THUMB_MSG_ID and THUMB_MSG_ID > 0:
+            thumb_msg = await client.get_messages(CHAT_ID, ids=THUMB_MSG_ID)
+            if thumb_msg and thumb_msg.photo:
+                thumb_path = await client.download_media(thumb_msg, file="custom_thumb.jpg")
 
-            if not thumb_path:
-                thumb_path = "auto_thumb.jpg"
-                subprocess.run([
-                    "ffmpeg", "-y", "-i", output_video, "-ss", "00:00:01",
-                    "-vframes", "1", "-q:v", "2", thumb_path
-                ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                if not os.path.exists(thumb_path):
-                    thumb_path = None
+        orig_w, orig_h, duration = get_video_info(input_video)
+        target_w, target_h = compute_target_resolution(orig_w, orig_h)
 
-            # 5. Upload Final Video to User
-            out_size_mb = os.path.getsize(output_video) / (1024 * 1024)
+        # 2. Extract Audio & Transcribe with Groq Whisper
+        await update_status(client, "🎙 <b>مرحله ۲ از ۵:</b> استخراج صدا و تشخیص گفتار (Groq Whisper)...", force=True)
+        audio_path = "extracted_audio.mp3"
+        extract_compressed_audio(input_video, audio_path)
+        segments = transcribe_audio_with_groq(audio_path)
+
+        if not segments:
+            await update_status(client, "⚠️ گفتگوی انگلیسی تشخیص داده نشد، در حال درج تگ...", force=True)
+            translated_subs = []
+        else:
+            # 3. Two-Pass Translation (Pass 1: Master Name Glossary -> Pass 2: Parallel Contextual Translation)
             await update_status(
-                app,
-                f"📤 <b>مرحله ۵ از ۵:</b> آپلود ویدیوی بهینه‌شده (<code>{out_size_mb:.1f} MB</code>)...",
+                client,
+                f"🧠 <b>مرحله ۳ از ۵:</b> تصحیح هوشمند اسامی و ترجمه موازی ({len(segments)} خط)...",
                 force=True
             )
+            translated_subs = await translate_segments_parallel(segments)
 
-            def upload_progress(current, total):
-                if total > 0:
-                    pct = (current / total) * 100.0
-                    mb_cur = current / (1024 * 1024)
-                    mb_tot = total / (1024 * 1024)
-                    bar = make_progress_bar(pct)
-                    text = (
-                        f"📤 <b>مرحله ۵ از ۵:</b> در حال آپلود ویدیوی نهایی...\n"
-                        f"{bar} <b>{pct:.1f}%</b> (<code>{mb_cur:.1f} / {mb_tot:.1f} MB</code>)"
-                    )
-                    asyncio.run_coroutine_threadsafe(update_status(app, text, force=False), loop)
+        # 4. Generate ASS & Burn with Ultra-Fast 720p FFmpeg
+        await update_status(client, "🎬 <b>مرحله ۴ از ۵:</b> شروع هاردساب فوق‌سریع زیرنویس زرد...", force=True)
+        ass_path = "subtitles.ass"
+        fonts_dir = "./fonts"
+        output_video = "output_subtitled.mp4"
 
-            elapsed_sec = int(time.time() - t_start)
-            mins, secs = divmod(elapsed_sec, 60)
+        generate_ass_file(translated_subs, USER_TAG, target_w, target_h, ass_path)
+        await burn_subtitles_ffmpeg_async(
+            client, input_video, ass_path, fonts_dir, output_video, target_w, target_h, duration
+        )
 
-            caption = (
-                "✅ <b>ویدیوی شما با موفقیت آماده شد!</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-                f"🏷 <b>تگ درج شده:</b> <code>{USER_TAG}</code>\n"
-                f"💬 <b>تعداد دیالوگ‌ها:</b> {len(translated_subs)} خط\n"
-                f"⏱ <b>زمان کل پردازش:</b> {mins} دقیقه و {secs} ثانیه\n"
-                "✨ <i>ترجمه و زیرنویس اختصاصی با هوش مصنوعی</i>"
-            )
+        if not thumb_path:
+            thumb_path = "auto_thumb.jpg"
+            subprocess.run([
+                "ffmpeg", "-y", "-i", output_video, "-ss", "00:00:01",
+                "-vframes", "1", "-q:v", "2", thumb_path
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if not os.path.exists(thumb_path):
+                thumb_path = None
 
-            await app.send_video(
-                chat_id=CHAT_ID,
-                video=output_video,
-                caption=caption,
-                thumb=thumb_path,
-                width=target_w,
-                height=target_h,
-                duration=duration,
-                supports_streaming=True,
-                reply_to_message_id=VIDEO_MSG_ID,
-                parse_mode=ParseMode.HTML,
-                progress=upload_progress
-            )
+        # 5. Parallel 8-Socket Upload (With ZERO extra text/caption under the video)
+        out_size_mb = os.path.getsize(output_video) / (1024 * 1024)
+        await update_status(
+            client,
+            f"📤 <b>مرحله ۵ از ۵:</b> آپلود موازی ۸ کاناله (<code>{out_size_mb:.1f} MB</code>)...",
+            force=True
+        )
 
-            try:
-                await app.delete_messages(CHAT_ID, STATUS_MSG_ID)
-            except Exception:
-                pass
-
-        except Exception as e:
-            error_msg = (
-                f"❌ <b>متاسفانه خطایی در حین پردازش رخ داد:</b>\n"
-                f"<code>{str(e)[:300]}</code>"
-            )
-            try:
-                await app.edit_message_text(
-                    chat_id=CHAT_ID,
-                    message_id=STATUS_MSG_ID,
-                    text=error_msg,
-                    parse_mode=ParseMode.HTML
+        async def ul_progress(current, total):
+            if total > 0:
+                pct = (current / total) * 100.0
+                mb_cur = current / (1024 * 1024)
+                mb_tot = total / (1024 * 1024)
+                bar = make_progress_bar(pct)
+                text = (
+                    f"📤 <b>مرحله ۵ از ۵:</b> آپلود پرسرعت ویدیوی نهایی...\n"
+                    f"{bar} <b>{pct:.1f}%</b> (<code>{mb_cur:.1f} / {mb_tot:.1f} MB</code>)"
                 )
-            except Exception as edit_err:
-                print(f"Could not edit status message with error: {edit_err}")
-            raise e
+                await update_status(client, text, force=False)
+
+        uploaded_input_file = await parallel_upload_file(
+            client, output_video, progress_callback=ul_progress, workers=8
+        )
+
+        # Send ONLY the video with no caption at all
+        await client.send_file(
+            CHAT_ID,
+            file=uploaded_input_file,
+            thumb=thumb_path,
+            supports_streaming=True,
+            reply_to=VIDEO_MSG_ID,
+            attributes=[
+                DocumentAttributeVideo(
+                    duration=duration,
+                    w=target_w,
+                    h=target_h,
+                    supports_streaming=True
+                )
+            ]
+        )
+
+        try:
+            await client.delete_messages(CHAT_ID, STATUS_MSG_ID)
+        except Exception:
+            pass
+
+    except Exception as e:
+        error_msg = (
+            f"❌ <b>متاسفانه خطایی در حین پردازش رخ داد:</b>\n"
+            f"<code>{str(e)[:300]}</code>"
+        )
+        try:
+            await client.edit_message(CHAT_ID, STATUS_MSG_ID, error_msg, parse_mode="html")
+        except Exception as edit_err:
+            print(f"Could not edit status message with error: {edit_err}")
+        raise e
+    finally:
+        await client.disconnect()
 
 
 if __name__ == "__main__":
