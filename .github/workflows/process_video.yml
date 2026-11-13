@@ -1,0 +1,68 @@
+name: Process & Subtitle Video
+
+on:
+  workflow_dispatch:
+    inputs:
+      chat_id:
+        description: "Telegram Chat ID"
+        required: true
+      status_msg_id:
+        description: "Telegram Status Message ID"
+        required: true
+      video_msg_id:
+        description: "Telegram Video Message ID"
+        required: true
+      thumb_msg_id:
+        description: "Telegram Thumbnail Message ID"
+        required: false
+        default: "0"
+      user_tag:
+        description: "User Watermark Tag"
+        required: true
+
+jobs:
+  render-subtitles:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install FFmpeg & Persian Font Shaping Libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg libass-dev libfreetype6-dev libfribidi-dev libharfbuzz-dev wget unzip
+
+      - name: Download Vazirmatn Persian Font
+        run: |
+          mkdir -p fonts
+          wget -q -O fonts/Vazirmatn-Bold.ttf https://github.com/rastikerdar/vazirmatn/raw/master/fonts/ttf/Vazirmatn-Bold.ttf
+          wget -q -O fonts/Vazirmatn-Regular.ttf https://github.com/rastikerdar/vazirmatn/raw/master/fonts/ttf/Vazirmatn-Regular.ttf
+          sudo cp fonts/*.ttf /usr/share/fonts/truetype/
+          sudo fc-cache -f -v
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Video Subtitle Worker
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          CHAT_ID: ${{ github.event.inputs.chat_id }}
+          STATUS_MSG_ID: ${{ github.event.inputs.status_msg_id }}
+          VIDEO_MSG_ID: ${{ github.event.inputs.video_msg_id }}
+          THUMB_MSG_ID: ${{ github.event.inputs.thumb_msg_id }}
+          USER_TAG: ${{ github.event.inputs.user_tag }}
+        run: python worker.py
