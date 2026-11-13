@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import time
 import math
 import asyncio
 import subprocess
@@ -26,6 +27,7 @@ USER_TAG = (os.getenv("USER_TAG") or "@YourChannelTag").strip()
 groq_client = Groq(api_key=GROQ_API_KEY)
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
+
 async def update_status(app: Client, step_text: str):
     try:
         text = (
@@ -44,6 +46,7 @@ async def update_status(app: Client, step_text: str):
     except Exception as e:
         print(f"Status update skipped: {e}")
 
+
 def get_video_info(video_path: str) -> tuple[int, int, int]:
     """Returns (width, height, duration_seconds) using ffprobe."""
     cmd = [
@@ -59,6 +62,7 @@ def get_video_info(video_path: str) -> tuple[int, int, int]:
     duration = int(float(data.get("format", {}).get("duration", 0)))
     return width, height, duration
 
+
 def extract_compressed_audio(video_path: str, audio_path: str):
     """Extracts mono 16kHz 32k MP3 so even 1-hour videos stay under Groq's 25MB limit."""
     cmd = [
@@ -68,16 +72,28 @@ def extract_compressed_audio(video_path: str, audio_path: str):
     ]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+
 def transcribe_audio_with_groq(audio_path: str) -> list[dict]:
-    """Uses Whisper-large-v3-turbo with precise segment timestamps."""
-    with open(audio_path, "rb") as f:
-        transcription = groq_client.audio.transcriptions.create(
-            file=(audio_path, f.read()),
-            model="whisper-large-v3-turbo",
-            response_format="verbose_json",
-            language="en",
-            temperature=0.0
-        )
+    """Uses Whisper on Groq with automatic model fallback if model names change."""
+    whisper_models = ["whisper-large-v3-turbo", "whisper-large-v3"]
+    transcription = None
+
+    for w_model in whisper_models:
+        try:
+            with open(audio_path, "rb") as f:
+                transcription = groq_client.audio.transcriptions.create(
+                    file=(audio_path, f.read()),
+                    model=w_model,
+                    response_format="verbose_json",
+                    language="en",
+                    temperature=0.0
+                )
+            break
+        except Exception as e:
+            print(f"Whisper model {w_model} failed: {e}")
+
+    if not transcription:
+        raise RuntimeError("All Groq Whisper transcription models failed.")
 
     raw_segments = getattr(transcription, "segments", []) or []
     clean_segments = []
@@ -105,10 +121,71 @@ def transcribe_audio_with_groq(audio_path: str) -> list[dict]:
 
     return clean_segments
 
+
+def get_available_gemini_models() -> list[str]:
+    """Dynamically fetches available Gemini text generation models + priority candidates."""
+    candidates = ["gemini-3.8-flash", "gemini-3.8-pro", "gemini-3.0-flash", "gemini-2.5-pro"]
+    if not gemini_client:
+        return []
+    try:
+        for m in gemini_client.models.list():
+            name = getattr(m, "name", "") or ""
+            if name.startswith("models/"):
+                name = name.replace("models/", "", 1)
+            # Filter for standard text generation Gemini models
+            if "gemini" in name and not any(x in name for x in ["embedding", "imagen", "veo", "audio", "tts", "vision", "aqa"]):
+                if name not in candidates:
+                    candidates.append(name)
+    except Exception as e:
+        print(f"Could not list Gemini models dynamically: {e}")
+    print(f"Discovered Gemini models: {candidates[:6]}")
+    return candidates[:6]
+
+
+def get_available_groq_chat_models() -> list[str]:
+    """Dynamically fetches active chat LLM models from your Groq account."""
+    candidates = []
+    try:
+        models_resp = groq_client.models.list()
+        for m in models_resp.data:
+            mid = m.id
+            # Exclude audio/whisper/guard/tts/embedding models
+            if not any(x in mid.lower() for x in ["whisper", "guard", "tts", "playai", "embed", "vision", "allam"]):
+                candidates.append(mid)
+    except Exception as e:
+        print(f"Could not list Groq models dynamically: {e}")
+
+    # Sort so larger/versatile models (llama, qwen, deepseek, gemma) are tried first
+    preferred_keywords = ["llama", "qwen", "deepseek", "gemma", "mixtral"]
+    candidates.sort(
+        key=lambda x: next((i for i, kw in enumerate(preferred_keywords) if kw in x.lower()), 99)
+    )
+    print(f"Discovered Groq chat models: {candidates}")
+    return candidates
+
+
+def extract_json_from_text(raw_text: str):
+    """Safely extracts JSON even if an LLM wraps it in ```json ... ``` markdown blocks."""
+    text = raw_text.strip()
+    if "```" in text:
+        parts = text.split("```")
+        for p in parts:
+            p_clean = p.strip()
+            if p_clean.startswith("json"):
+                p_clean = p_clean[4:].strip()
+            if p_clean.startswith("{") or p_clean.startswith("["):
+                text = p_clean
+                break
+    return json.loads(text)
+
+
 def translate_segments_to_persian(segments: list[dict]) -> list[dict]:
     """Translates English subtitle segments into natural conversational Persian in batches."""
     if not segments:
         return []
+
+    gemini_models = get_available_gemini_models()
+    groq_models = get_available_groq_chat_models()
 
     translated_all = []
     batch_size = 35
@@ -120,8 +197,8 @@ def translate_segments_to_persian(segments: list[dict]) -> list[dict]:
         "Rules:\n"
         "1. Keep each Persian line concise so it reads smoothly as a video subtitle.\n"
         "2. Translate idioms and slang naturally into Persian equivalents, NEVER word-for-word robotic translation.\n"
-        "3. Return ONLY a valid JSON object with a single key 'translations' containing the array of objects "
-        "with the exact same 'id' and a 'fa' field containing the Persian translation."
+        "3. Return ONLY a valid JSON object with a single key \"translations\" containing the array of objects "
+        "with the exact same \"id\" and a \"fa\" field containing the Persian translation. Do not include markdown."
     )
 
     for i in range(0, len(segments), batch_size):
@@ -131,43 +208,62 @@ def translate_segments_to_persian(segments: list[dict]) -> list[dict]:
             ensure_ascii=False
         )
 
-        raw_json_text = None
+        parsed_json = None
 
-        # 1. Try Gemini 3.8 Flash first
+        # 1. Try available Gemini models (with brief retry on 503 high demand)
         if gemini_client:
-            try:
-                response = gemini_client.models.generate_content(
-                    model="gemini-3.8-flash",
-                    contents=prompt_payload,
-                    config=types.GenerateContentConfig(
-                        system_instruction=system_instruction,
-                        response_mime_type="application/json",
+            for g_model in gemini_models:
+                for attempt in range(2):
+                    try:
+                        response = gemini_client.models.generate_content(
+                            model=g_model,
+                            contents=prompt_payload,
+                            config=types.GenerateContentConfig(
+                                system_instruction=system_instruction,
+                                response_mime_type="application/json",
+                                temperature=0.2
+                            )
+                        )
+                        parsed_json = extract_json_from_text(response.text)
+                        print(f"Batch {i} translated successfully using Gemini model: {g_model}")
+                        break
+                    except Exception as gemini_err:
+                        err_str = str(gemini_err)
+                        print(f"Gemini {g_model} (attempt {attempt + 1}) failed: {err_str[:160]}")
+                        if "503" in err_str or "UNAVAILABLE" in err_str:
+                            time.sleep(3)
+                        else:
+                            break
+                if parsed_json is not None:
+                    break
+
+        # 2. Automatic Fallback to dynamically discovered Groq Chat Models
+        if parsed_json is None:
+            for q_model in groq_models:
+                try:
+                    chat_completion = groq_client.chat.completions.create(
+                        model=q_model,
+                        messages=[
+                            {"role": "system", "content": system_instruction},
+                            {"role": "user", "content": prompt_payload}
+                        ],
                         temperature=0.2
                     )
-                )
-                raw_json_text = response.text
-            except Exception as gemini_err:
-                print(f"Gemini error on batch {i}, falling back to Groq LLM: {gemini_err}")
+                    raw_text = chat_completion.choices[0].message.content
+                    parsed_json = extract_json_from_text(raw_text)
+                    print(f"Batch {i} translated successfully using Groq model: {q_model}")
+                    break
+                except Exception as groq_err:
+                    print(f"Groq model {q_model} failed: {str(groq_err)[:160]}")
 
-        # 2. Automatic Fallback to Groq (Llama 3.3 70B) if Gemini fails
-        if not raw_json_text:
-            chat_completion = groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[
-                    {"role": "system", "content": system_instruction},
-                    {"role": "user", "content": prompt_payload}
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.2
-            )
-            raw_json_text = chat_completion.choices[0].message.content
+        if parsed_json is None:
+            raise RuntimeError("All Gemini and Groq translation models failed on this batch.")
 
         try:
-            parsed = json.loads(raw_json_text)
-            fa_list = parsed.get("translations", parsed) if isinstance(parsed, dict) else parsed
-            fa_map = {int(item["id"]): item["fa"] for item in fa_list if "id" in item and "fa" in item}
+            fa_list = parsed_json.get("translations", parsed_json) if isinstance(parsed_json, dict) else parsed_json
+            fa_map = {int(item["id"]): str(item["fa"]) for item in fa_list if "id" in item and "fa" in item}
         except Exception as e:
-            print(f"JSON parse fallback on batch {i}: {e}")
+            print(f"JSON mapping fallback on batch {i}: {e}")
             fa_map = {}
 
         for item in batch:
@@ -180,6 +276,7 @@ def translate_segments_to_persian(segments: list[dict]) -> list[dict]:
 
     return translated_all
 
+
 def format_ass_time(seconds: float) -> str:
     """Converts seconds to ASS timestamp format H:MM:SS.cc"""
     hrs = int(seconds // 3600)
@@ -189,6 +286,7 @@ def format_ass_time(seconds: float) -> str:
     if centis >= 100:
         centis = 99
     return f"{hrs}:{mins:02d}:{secs:02d}.{centis:02d}"
+
 
 def generate_ass_file(subtitles: list[dict], user_tag: str, width: int, height: int, ass_path: str):
     """
@@ -235,6 +333,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     with open(ass_path, "w", encoding="utf-8-sig") as f:
         f.write("\n".join(lines) + "\n")
 
+
 def burn_subtitles_ffmpeg(input_video: str, ass_path: str, fonts_dir: str, output_video: str):
     """Burns the .ass subtitles and watermark tag using hardware-friendly libx264 settings."""
     vf_filter = f"ass={ass_path}:fontsdir={fonts_dir}"
@@ -247,6 +346,7 @@ def burn_subtitles_ffmpeg(input_video: str, ass_path: str, fonts_dir: str, outpu
         output_video
     ]
     subprocess.run(cmd, check=True)
+
 
 async def main():
     app = Client(
@@ -282,7 +382,7 @@ async def main():
                 await update_status(app, "⚠️ هیچ گفتگوی انگلیسی در این ویدیو تشخیص داده نشد، در حال درج تگ و آماده‌سازی...")
                 translated_subs = []
             else:
-                # 3. Contextual Persian Translation with Gemini 3.8 Flash (+ Groq Fallback)
+                # 3. Contextual Persian Translation with Auto-Discovered Gemini/Groq Models
                 await update_status(
                     app,
                     f"🧠 <b>مرحله ۳ از ۵:</b> در حال ترجمه هوشمند و محاوره‌ای ({len(segments)} بخش گفتاری)..."
@@ -332,20 +432,27 @@ async def main():
                 parse_mode=ParseMode.HTML
             )
 
-            await app.delete_messages(CHAT_ID, STATUS_MSG_ID)
+            try:
+                await app.delete_messages(CHAT_ID, STATUS_MSG_ID)
+            except Exception:
+                pass
 
         except Exception as e:
             error_msg = (
                 f"❌ <b>متاسفانه خطایی در حین پردازش رخ داد:</b>\n"
                 f"<code>{str(e)[:300]}</code>"
             )
-            await app.edit_message_text(
-                chat_id=CHAT_ID,
-                message_id=STATUS_MSG_ID,
-                text=error_msg,
-                parse_mode=ParseMode.HTML
-            )
+            try:
+                await app.edit_message_text(
+                    chat_id=CHAT_ID,
+                    message_id=STATUS_MSG_ID,
+                    text=error_msg,
+                    parse_mode=ParseMode.HTML
+                )
+            except Exception as edit_err:
+                print(f"Could not edit status message with error: {edit_err}")
             raise e
+
 
 if __name__ == "__main__":
     asyncio.run(main())
