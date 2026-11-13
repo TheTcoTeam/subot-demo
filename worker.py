@@ -8,11 +8,10 @@ import asyncio
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 
-from telethon import TelegramClient, utils
+from telethon import TelegramClient
 from telethon.tl.types import (
     DocumentAttributeVideo,
     InputDocumentFileLocation,
-    InputPhotoFileLocation,
     InputFile,
     InputFileBig,
 )
@@ -21,11 +20,6 @@ from telethon.tl.functions.upload import (
     SaveFilePartRequest,
     SaveBigFilePartRequest,
 )
-from telethon.network import MTProtoSender
-from telethon.tl.functions.auth import ExportAuthorizationRequest, ImportAuthorizationRequest
-from telethon.tl.functions.InitConnectionRequest import InitConnectionRequest
-from telethon.tl.functions.InvokeWithLayerRequest import InvokeWithLayerRequest
-from telethon.tl.alltlobjects import LAYER
 
 from groq import Groq
 from google import genai
@@ -103,7 +97,6 @@ async def parallel_download_file(
         thumb_size=""
     )
 
-    # Pre-allocate file on disk
     with open(output_path, "wb") as f:
         f.truncate(file_size)
 
@@ -402,7 +395,6 @@ def build_video_context_and_name_glossary(
     """
     full_script_sample = " ".join(s["text"] for s in segments)
     if len(full_script_sample) > 12000:
-        # Take beginning, middle, and end if the video is very long
         third = len(full_script_sample) // 3
         full_script_sample = (
             full_script_sample[:4000] + " ... " +
