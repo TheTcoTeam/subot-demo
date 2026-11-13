@@ -17,14 +17,14 @@ BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or "").strip()
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
 
-CHAT_ID = int(os.getenv("CHAT_ID") or "0")
-STATUS_MSG_ID = int(os.getenv("STATUS_MSG_ID") or "0")
-VIDEO_MSG_ID = int(os.getenv("VIDEO_MSG_ID") or "0")
-THUMB_MSG_ID = int(os.getenv("THUMB_MSG_ID") or "0")
-USER_TAG = os.getenv("USER_TAG") or "@YourChannelTag"
+CHAT_ID = int((os.getenv("CHAT_ID") or "0").strip())
+STATUS_MSG_ID = int((os.getenv("STATUS_MSG_ID") or "0").strip())
+VIDEO_MSG_ID = int((os.getenv("VIDEO_MSG_ID") or "0").strip())
+THUMB_MSG_ID = int((os.getenv("THUMB_MSG_ID") or "0").strip())
+USER_TAG = (os.getenv("USER_TAG") or "@YourChannelTag").strip()
 
 groq_client = Groq(api_key=GROQ_API_KEY)
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 async def update_status(app: Client, step_text: str):
     try:
@@ -83,11 +83,14 @@ def transcribe_audio_with_groq(audio_path: str) -> list[dict]:
     clean_segments = []
 
     for seg in raw_segments:
-        # Handle dict or object attributes from Groq SDK
         start = seg["start"] if isinstance(seg, dict) else seg.start
         end = seg["end"] if isinstance(seg, dict) else seg.end
         text = (seg["text"] if isinstance(seg, dict) else seg.text).strip()
-        no_speech = (seg.get("no_speech_prob", 0.0) if isinstance(seg, dict) else getattr(seg, "no_speech_prob", 0.0))
+        no_speech = (
+            seg.get("no_speech_prob", 0.0)
+            if isinstance(seg, dict)
+            else getattr(seg, "no_speech_prob", 0.0)
+        )
 
         # Cut out silence / hallucinations so subtitles vanish when nobody speaks
         if not text or no_speech > 0.65:
@@ -131,7 +134,7 @@ def translate_segments_to_persian(segments: list[dict]) -> list[dict]:
         raw_json_text = None
 
         # 1. Try Gemini 3.8 Flash first
-        if GEMINI_API_KEY:
+        if gemini_client:
             try:
                 response = gemini_client.models.generate_content(
                     model="gemini-3.8-flash",
@@ -144,7 +147,7 @@ def translate_segments_to_persian(segments: list[dict]) -> list[dict]:
                 )
                 raw_json_text = response.text
             except Exception as gemini_err:
-                print(f"Gemini error, falling back to Groq LLM: {gemini_err}")
+                print(f"Gemini error on batch {i}, falling back to Groq LLM: {gemini_err}")
 
         # 2. Automatic Fallback to Groq (Llama 3.3 70B) if Gemini fails
         if not raw_json_text:
@@ -192,7 +195,6 @@ def generate_ass_file(subtitles: list[dict], user_tag: str, width: int, height: 
     Generates an .ass file scaled dynamically to the video resolution (Portrait Reels or Landscape 16:9).
     - Yellow Persian subtitles (&H0000FFFF) sit cleanly above the bottom watermark tag.
     """
-    # Scale font sizes dynamically based on video resolution
     min_dim = min(width, height)
     sub_font_size = max(24, int(min_dim * 0.046))   # Clean, small-medium readable size
     tag_font_size = max(18, int(min_dim * 0.032))   # Subtle watermark tag at very bottom
@@ -280,7 +282,7 @@ async def main():
                 await update_status(app, "⚠️ هیچ گفتگوی انگلیسی در این ویدیو تشخیص داده نشد، در حال درج تگ و آماده‌سازی...")
                 translated_subs = []
             else:
-                # 3. Contextual Persian Translation with Gemini
+                # 3. Contextual Persian Translation with Gemini 3.8 Flash (+ Groq Fallback)
                 await update_status(
                     app,
                     f"🧠 <b>مرحله ۳ از ۵:</b> در حال ترجمه هوشمند و محاوره‌ای ({len(segments)} بخش گفتاری)..."
@@ -296,7 +298,7 @@ async def main():
             generate_ass_file(translated_subs, USER_TAG, width, height, ass_path)
             burn_subtitles_ffmpeg(input_video, ass_path, fonts_dir, output_video)
 
-            # If user didn't send a custom thumbnail, extract a clean frame at 1s so Telegram displays a nice preview
+            # If user didn't send a custom thumbnail, extract a clean frame at 1s
             if not thumb_path:
                 thumb_path = "auto_thumb.jpg"
                 subprocess.run([
