@@ -11,8 +11,8 @@ from google import genai
 from google.genai import types
 
 # ================= INPUTS & SECRETS =================
-API_ID = int(os.getenv("TG_API_ID"))
-API_HASH = os.getenv("TG_API_HASH")
+API_ID = int(os.getenv("TG_API_ID", "2040"))
+API_HASH = os.getenv("TG_API_HASH", "b18441a1ff607e10a989891a5462e627")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
