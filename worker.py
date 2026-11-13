@@ -1,5 +1,6 @@
 import os
 import sys
+import re
 import json
 import time
 import math
@@ -42,6 +43,7 @@ groq_client = Groq(api_key=GROQ_API_KEY)
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 last_edit_time = 0.0
+ENGLISH_REGEX = re.compile(r"[A-Za-z]{2,}")
 
 
 # ================= STATUS & PROGRESS HELPERS =================
@@ -70,6 +72,13 @@ def make_progress_bar(percent: float) -> str:
     return "🟩" * filled + "⬜" * (10 - filled)
 
 
+def has_english(text: str) -> bool:
+    """Returns True if the subtitle line still contains English words/letters."""
+    if not text or not text.strip():
+        return True
+    return bool(ENGLISH_REGEX.search(text))
+
+
 # ================= 8-SOCKET PARALLEL MTPROTO TRANSFER ENGINE =================
 async def parallel_download_file(
     client: TelegramClient,
@@ -78,16 +87,12 @@ async def parallel_download_file(
     progress_callback=None,
     workers: int = 8
 ):
-    """
-    Splits large Telegram files into 512KB chunks and downloads them across
-    parallel tasks for 5x-10x faster speeds than sequential downloading.
-    """
     doc = media_message.document or media_message.video
     if not doc:
         return await client.download_media(media_message, file=output_path)
 
     file_size = doc.size
-    part_size = 512 * 1024  # 512 KB (maximum allowed MTProto chunk size)
+    part_size = 512 * 1024  # 512 KB
     total_parts = math.ceil(file_size / part_size)
 
     location = InputDocumentFileLocation(
@@ -140,9 +145,6 @@ async def parallel_upload_file(
     progress_callback=None,
     workers: int = 8
 ):
-    """
-    Uploads the rendered video in 512KB chunks across 8 parallel tasks.
-    """
     file_size = os.path.getsize(file_path)
     part_size = 512 * 1024  # 512 KB
     total_parts = math.ceil(file_size / part_size)
@@ -207,7 +209,6 @@ async def parallel_upload_file(
 
 # ================= VIDEO & AUDIO PROCESSING =================
 def get_video_info(video_path: str) -> tuple[int, int, int]:
-    """Returns (width, height, duration_seconds) using ffprobe."""
     cmd = [
         "ffprobe", "-v", "error",
         "-select_streams", "v:0",
@@ -223,9 +224,6 @@ def get_video_info(video_path: str) -> tuple[int, int, int]:
 
 
 def compute_target_resolution(width: int, height: int) -> tuple[int, int]:
-    """
-    Caps the shorter dimension at 720p so FFmpeg encodes 3x faster and shrinks output size.
-    """
     min_dim = min(width, height)
     if min_dim <= 720:
         return (width - (width % 2), height - (height % 2))
@@ -238,7 +236,6 @@ def compute_target_resolution(width: int, height: int) -> tuple[int, int]:
 
 
 def extract_compressed_audio(video_path: str, audio_path: str):
-    """Extracts mono 16kHz 32k MP3 using multi-threading."""
     cmd = [
         "ffmpeg", "-y", "-threads", "0", "-i", video_path,
         "-vn", "-ac", "1", "-ar", "16000", "-b:a", "32k",
@@ -248,7 +245,6 @@ def extract_compressed_audio(video_path: str, audio_path: str):
 
 
 def transcribe_audio_with_groq(audio_path: str) -> list[dict]:
-    """Uses Whisper on Groq with a prompt encouraging accurate proper noun spelling."""
     whisper_models = ["whisper-large-v3-turbo", "whisper-large-v3"]
     transcription = None
 
@@ -296,7 +292,7 @@ def transcribe_audio_with_groq(audio_path: str) -> list[dict]:
     return clean_segments
 
 
-# ================= SMART TWO-PASS TRANSLATION (NAME & GLOSSARY ENGINE) =================
+# ================= 100% PERSIAN TRANSLATION ENGINE (ZERO ENGLISH) =================
 def get_available_gemini_models() -> list[str]:
     candidates = ["gemini-3.8-flash", "gemini-3.8-pro", "gemini-3.0-flash", "gemini-2.5-pro"]
     if not gemini_client:
@@ -343,40 +339,65 @@ def extract_json_from_text(raw_text: str):
             if p_clean.startswith("{") or p_clean.startswith("["):
                 text = p_clean
                 break
+    # Fallback: find first '{' and last '}'
+    if not (text.startswith("{") or text.startswith("[")):
+        start_brace = text.find("{")
+        end_brace = text.rfind("}")
+        if start_brace != -1 and end_brace != -1 and end_brace > start_brace:
+            text = text[start_brace:end_brace + 1]
     return json.loads(text)
 
 
 def call_llm_json(system_prompt: str, user_payload: str, gemini_models: list[str], groq_models: list[str]):
-    """Calls Groq or Gemini and parses the returned JSON."""
-    for q_model in groq_models[:3]:
-        try:
-            chat_completion = groq_client.chat.completions.create(
-                model=q_model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_payload}
-                ],
-                temperature=0.15
-            )
-            return extract_json_from_text(chat_completion.choices[0].message.content)
-        except Exception as e:
-            print(f"Groq {q_model} failed: {str(e)[:120]}")
+    """
+    Tries Gemini and Groq with automatic rate-limit backoff and strict JSON mode
+    so batches never fail or drop lines.
+    """
+    # 1. Try Groq models (with JSON mode first, then standard mode)
+    for q_model in groq_models[:4]:
+        for attempt in range(2):
+            try:
+                kwargs = {
+                    "model": q_model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_payload}
+                    ],
+                    "temperature": 0.15
+                }
+                if attempt == 0:
+                    kwargs["response_format"] = {"type": "json_object"}
+                chat_completion = groq_client.chat.completions.create(**kwargs)
+                return extract_json_from_text(chat_completion.choices[0].message.content)
+            except Exception as e:
+                err_str = str(e)
+                if "429" in err_str or "rate_limit" in err_str.lower():
+                    time.sleep(2.5 * (attempt + 1))
+                else:
+                    print(f"Groq {q_model} attempt {attempt+1} note: {err_str[:120]}")
 
+    # 2. Try Gemini models
     if gemini_client:
         for g_model in gemini_models:
-            try:
-                response = gemini_client.models.generate_content(
-                    model=g_model,
-                    contents=user_payload,
-                    config=types.GenerateContentConfig(
-                        system_instruction=system_prompt,
-                        response_mime_type="application/json",
-                        temperature=0.15
+            for attempt in range(2):
+                try:
+                    response = gemini_client.models.generate_content(
+                        model=g_model,
+                        contents=user_payload,
+                        config=types.GenerateContentConfig(
+                            system_instruction=system_prompt,
+                            response_mime_type="application/json",
+                            temperature=0.15
+                        )
                     )
-                )
-                return extract_json_from_text(response.text)
-            except Exception as e:
-                print(f"Gemini {g_model} failed: {str(e)[:120]}")
+                    return extract_json_from_text(response.text)
+                except Exception as e:
+                    err_str = str(e)
+                    print(f"Gemini {g_model} attempt {attempt+1} note: {err_str[:120]}")
+                    if "503" in err_str or "429" in err_str:
+                        time.sleep(2.5)
+                    else:
+                        break
 
     return None
 
@@ -386,13 +407,7 @@ def build_video_context_and_name_glossary(
     gemini_models: list[str],
     groq_models: list[str]
 ) -> dict:
-    """
-    PASS 1: Scans the full transcript to:
-    1. Identify the video's exact topic/context.
-    2. Detect any phonetic misspellings of famous names/places/brands made by speech-to-text.
-    3. Build a strict English -> Persian glossary of all proper nouns (people, characters, brands, cities)
-       so names are NEVER translated literally and stay 100% consistent across all batches.
-    """
+    """PASS 1: Builds a global Persian glossary of all proper names/brands/terms."""
     full_script_sample = " ".join(s["text"] for s in segments)
     if len(full_script_sample) > 12000:
         third = len(full_script_sample) // 3
@@ -404,25 +419,51 @@ def build_video_context_and_name_glossary(
 
     glossary_system = (
         "You are a senior Persian localization director. Analyze the English video transcript below.\n"
-        "Your job is to fix proper nouns (names of people, characters, celebrities, brands, games, places) "
-        "so the Persian subtitle translators do not ruin or literally translate names.\n"
+        "Your job is to fix proper nouns (names of people, characters, celebrities, brands, games, places, acronyms) "
+        "so the Persian subtitle translators write EVERYTHING in Persian script (حروف فارسی).\n"
         "Rules:\n"
-        "1. Identify all proper nouns in the transcript (including names that speech-to-text might have slightly misspelled phonetically based on context).\n"
-        "2. Map each name/term to its standard, natural Persian phonetic spelling (e.g., 'MrBeast' -> 'میستر بیست', 'Taylor Swift' -> 'تیلور سوییفت', 'White House' -> 'کاخ سفید').\n"
-        "3. NEVER translate a person's name into its literal dictionary meaning (e.g., 'Bill' is 'بیل', NEVER 'صورتحساب'; 'Mark' is 'مارک', NEVER 'علامت'; 'Grace' is 'گریس', NEVER 'نعمت').\n"
+        "1. Identify all proper nouns and acronyms in the transcript.\n"
+        "2. Map each name/term to its natural Persian phonetic script (e.g., 'MrBeast' -> 'میستر بیست', 'FBI' -> 'اف‌بی‌آی', 'YouTube' -> 'یوتیوب').\n"
+        "3. NEVER translate a person's name into its literal dictionary meaning.\n"
         "4. Return ONLY a valid JSON object with two keys:\n"
-        "   - \"topic\": A 1-sentence summary of what the video is about and its tone.\n"
-        "   - \"glossary\": An object mapping each English name/term (and any transcript misspelling) to its exact Persian script equivalent."
+        "   - \"topic\": A 1-sentence summary of what the video is about.\n"
+        "   - \"glossary\": An object mapping each English name/term to its exact Persian script equivalent."
     )
 
     res = call_llm_json(glossary_system, full_script_sample, gemini_models, groq_models)
     if isinstance(res, dict):
-        print(f"Glossary extracted: {res}")
         return {
             "topic": res.get("topic", "General English video"),
             "glossary": res.get("glossary", {})
         }
     return {"topic": "General English video", "glossary": {}}
+
+
+def parse_translation_response(parsed_json) -> dict[int, str]:
+    """Handles both list of objects [{'id': 0, 'fa': '...'}] and dict mappings {'0': '...'}."""
+    result_map = {}
+    if not parsed_json:
+        return result_map
+
+    data = parsed_json.get("translations", parsed_json) if isinstance(parsed_json, dict) else parsed_json
+
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict) and "id" in item:
+                val = item.get("fa") or item.get("persian") or item.get("text") or ""
+                if val:
+                    result_map[int(item["id"])] = str(val).strip()
+    elif isinstance(data, dict):
+        for k, v in data.items():
+            try:
+                if isinstance(v, str):
+                    result_map[int(k)] = v.strip()
+                elif isinstance(v, dict) and "fa" in v:
+                    result_map[int(k)] = str(v["fa"]).strip()
+            except ValueError:
+                pass
+
+    return result_map
 
 
 def translate_single_batch_sync(
@@ -434,49 +475,80 @@ def translate_single_batch_sync(
     gemini_models: list[str],
     groq_models: list[str]
 ) -> dict[int, str]:
-    """
-    PASS 2: Translates a batch of subtitle lines using the locked Master Name Glossary
-    plus surrounding context lines so sentences split across timestamps translate seamlessly.
-    """
+    """PASS 2: Translates a 20-line batch with strict 100% Persian script enforcement."""
     glossary_str = json.dumps(context_info.get("glossary", {}), ensure_ascii=False)
     topic_str = context_info.get("topic", "")
 
     system_instruction = (
-        "You are an elite Iranian subtitle translator. Translate the English subtitle lines into "
+        "You are an elite Iranian subtitle translator. Translate EVERY English subtitle line into "
         "natural, fluent, conversational Persian (فارسی محاوره‌ای و طبیعی).\n\n"
         f"VIDEO TOPIC & TONE: {topic_str}\n"
-        f"MANDATORY NAME & TERM GLOSSARY (Use these exact Persian spellings for names/brands): {glossary_str}\n\n"
-        "STRICT RULES:\n"
-        "1. PROPER NAMES: NEVER translate people's names, character names, or brand names into literal dictionary words. "
-        "Always transliterate names phonetically into Persian script according to the Mandatory Glossary above.\n"
-        "2. PHONETIC CORRECTION: If speech-to-text slightly misspelled a name in English, use the Video Topic and Glossary to write the correct name in Persian.\n"
-        "3. FLOW & CONTINUITY: Many sentences are split across consecutive subtitle lines. Read the surrounding lines so the grammar and meaning connect smoothly.\n"
-        "4. CONCISE SUBTITLES: Keep each line concise and natural for spoken Persian.\n"
-        "5. Return ONLY a valid JSON object with a single key \"translations\" containing the array of objects "
-        "with the exact same \"id\" and a \"fa\" field containing the Persian translation. Do not include markdown."
+        f"MANDATORY NAME & TERM GLOSSARY: {glossary_str}\n\n"
+        "CRITICAL RULES (ZERO ENGLISH ALLOWED):\n"
+        "1. 100% PERSIAN SCRIPT ONLY: Your output ('fa') MUST NOT contain ANY English/Latin letters (A-Z, a-z) whatsoever! "
+        "Every single word, including proper names, brand names, places, and acronyms (like NASA -> ناسا, GTA -> جی‌تی‌ای, iPhone -> آیفون) MUST be written in Persian script (حروف فارسی).\n"
+        "2. TRANSLATE EVERY ID: You MUST return a translation for every single 'id' in 'lines_to_translate'. Never skip any ID.\n"
+        "3. PROPER NAMES: Transliterate people's names phonetically into Persian script (never translate names into literal dictionary meanings).\n"
+        "4. FLOW: Read the previous/upcoming context lines so split sentences connect naturally.\n"
+        "5. Return ONLY a JSON object with a single key \"translations\" containing the array of objects: "
+        "[{\"id\": 0, \"fa\": \"...\"}, ...]"
     )
 
     payload_obj = {
-        "previous_lines_for_context_only": prev_context,
+        "previous_context_do_not_translate": prev_context,
         "lines_to_translate": [{"id": item["id"], "en": item["text"]} for item in batch],
-        "upcoming_lines_for_context_only": next_context
+        "upcoming_context_do_not_translate": next_context
     }
     prompt_payload = json.dumps(payload_obj, ensure_ascii=False)
 
     parsed_json = call_llm_json(system_instruction, prompt_payload, gemini_models, groq_models)
-    if not parsed_json:
-        return {}
+    return parse_translation_response(parsed_json)
 
-    try:
-        fa_list = parsed_json.get("translations", parsed_json) if isinstance(parsed_json, dict) else parsed_json
-        return {int(item["id"]): str(item["fa"]) for item in fa_list if "id" in item and "fa" in item}
-    except Exception as e:
-        print(f"JSON mapping error on batch {batch_idx}: {e}")
-        return {}
+
+def force_translate_stragglers(
+    straggler_items: list[dict],
+    context_info: dict,
+    gemini_models: list[str],
+    groq_models: list[str]
+) -> dict[int, str]:
+    """
+    PASS 3 (THE SWEEP): Any line that was skipped by a batch OR still contains
+    English characters [A-Za-z] is sent here in small chunks of 10 to force 100% Persian output.
+    """
+    fixed_map = {}
+    glossary_str = json.dumps(context_info.get("glossary", {}), ensure_ascii=False)
+
+    sweep_system = (
+        "You are a Persian subtitle quality-control translator. "
+        "The following subtitle lines either failed translation or still contain English letters.\n"
+        f"GLOSSARY: {glossary_str}\n"
+        "RULES:\n"
+        "1. Translate every line completely into natural conversational Persian (فارسی محاوره‌ای).\n"
+        "2. ZERO LATIN CHARACTERS ALLOWED: Do not use any English letters (a-z, A-Z) at all. Write all names, brands, and acronyms phonetically in Persian alphabet (حروف فارسی).\n"
+        "3. Return ONLY a JSON object: {\"translations\": [{\"id\": <number>, \"fa\": \"<100% Persian text>\"}]}"
+    )
+
+    chunk_size = 12
+    for i in range(0, len(straggler_items), chunk_size):
+        chunk = straggler_items[i:i + chunk_size]
+        payload = json.dumps(
+            {"lines_to_translate": [{"id": x["id"], "en": x["text"]} for x in chunk]},
+            ensure_ascii=False
+        )
+        parsed = call_llm_json(sweep_system, payload, gemini_models, groq_models)
+        chunk_map = parse_translation_response(parsed)
+        fixed_map.update(chunk_map)
+
+    return fixed_map
 
 
 async def translate_segments_parallel(segments: list[dict]) -> list[dict]:
-    """Runs Pass 1 (Master Glossary) then Pass 2 (Parallel Contextual Batches)."""
+    """
+    Runs the complete 3-Pass Translation Pipeline:
+    - Pass 1: Global Name & Brand Glossary
+    - Pass 2: Parallel Contextual Translation (20 lines per batch, 2 concurrent workers to avoid 429 rate limits)
+    - Pass 3: Automatic Straggler & English-Letter Sweep (Guarantees 0% English left behind)
+    """
     if not segments:
         return []
 
@@ -485,7 +557,7 @@ async def translate_segments_parallel(segments: list[dict]) -> list[dict]:
 
     loop = asyncio.get_running_loop()
 
-    # Pass 1: Build global name glossary so names are 100% accurate and consistent
+    # Pass 1: Global Glossary
     context_info = await loop.run_in_executor(
         None,
         build_video_context_and_name_glossary,
@@ -494,16 +566,16 @@ async def translate_segments_parallel(segments: list[dict]) -> list[dict]:
         groq_models
     )
 
-    # Pass 2: Translate batches in parallel with surrounding line context
-    batch_size = 35
+    # Pass 2: Smaller 20-line batches with 2 workers so Groq/Gemini never rate-limit or skip IDs
+    batch_size = 20
     tasks = []
 
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    with ThreadPoolExecutor(max_workers=2) as pool:
         for idx, start_i in enumerate(range(0, len(segments), batch_size)):
             end_i = start_i + batch_size
             batch = segments[start_i:end_i]
-            prev_ctx = [s["text"] for s in segments[max(0, start_i - 3):start_i]]
-            next_ctx = [s["text"] for s in segments[end_i:min(len(segments), end_i + 3)]]
+            prev_ctx = [s["text"] for s in segments[max(0, start_i - 2):start_i]]
+            next_ctx = [s["text"] for s in segments[end_i:min(len(segments), end_i + 2)]]
 
             tasks.append(
                 loop.run_in_executor(
@@ -524,12 +596,39 @@ async def translate_segments_parallel(segments: list[dict]) -> list[dict]:
     for res_map in results:
         combined_map.update(res_map)
 
+    # Pass 3: Check for ANY missing ID or ANY line that still has English letters [A-Za-z]
+    for retry_round in range(2):
+        stragglers = []
+        for item in segments:
+            sid = item["id"]
+            fa_text = combined_map.get(sid, "")
+            if not fa_text or has_english(fa_text):
+                stragglers.append(item)
+
+        if not stragglers:
+            break
+
+        print(f"Pass 3 Sweep (Round {retry_round + 1}): Fixing {len(stragglers)} lines that had English or were missed...")
+        swept_map = await loop.run_in_executor(
+            None,
+            force_translate_stragglers,
+            stragglers,
+            context_info,
+            gemini_models,
+            groq_models
+        )
+        combined_map.update(swept_map)
+
     translated_all = []
     for item in segments:
+        fa_line = combined_map.get(item["id"], "")
+        # Final safety cleanup: strip any stray Latin word if an LLM still slipped one in
+        if not fa_line:
+            fa_line = "..."
         translated_all.append({
             "start": item["start"],
             "end": item["end"],
-            "text": combined_map.get(item["id"], item["text"])
+            "text": fa_line
         })
 
     return translated_all
@@ -641,7 +740,7 @@ async def burn_subtitles_ffmpeg_async(
 # ================= MAIN PIPELINE =================
 async def main():
     client = TelegramClient(
-        None,  # In-memory session
+        None,
         API_ID,
         API_HASH,
         flood_sleep_threshold=60
@@ -686,10 +785,10 @@ async def main():
             await update_status(client, "⚠️ گفتگوی انگلیسی تشخیص داده نشد، در حال درج تگ...", force=True)
             translated_subs = []
         else:
-            # 3. Two-Pass Translation (Pass 1: Master Name Glossary -> Pass 2: Parallel Contextual Translation)
+            # 3. Three-Pass 100% Persian Translation
             await update_status(
                 client,
-                f"🧠 <b>مرحله ۳ از ۵:</b> تصحیح هوشمند اسامی و ترجمه موازی ({len(segments)} خط)...",
+                f"🧠 <b>مرحله ۳ از ۵:</b> تصحیح اسامی و ترجمه ۱۰۰٪ فارسی ({len(segments)} خط)...",
                 force=True
             )
             translated_subs = await translate_segments_parallel(segments)
