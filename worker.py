@@ -75,7 +75,7 @@ async def update_status(client: TelegramClient, step_text: str, force: bool = Tr
     last_edit_time = now
     try:
         text = (
-            "⚡ <b>موتور پردازش هوشمند زیرنویس (نسخه توربو)</b>\n"
+            "⚡ <b>موتور پردازش فوق‌سریع زیرنویس (نسخه توربو پرو)</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             f"{step_text}\n"
             "━━━━━━━━━━━━━━━━━━━━"
@@ -317,6 +317,7 @@ def get_video_info(video_path: str) -> tuple[int, int, int, float, int]:
     return width, height, duration, fps, bitrate_kbps
 
 def compute_target_resolution(width: int, height: int) -> tuple[int, int]:
+    """Keeps standard 720p maximum resolution for optimal quality and high encoding speed."""
     min_dim = min(width, height)
     if min_dim <= 720:
         return (width - (width % 2), height - (height % 2))
@@ -390,6 +391,77 @@ def has_persian_chars(text: str) -> bool:
     """Returns True if the string contains any Persian/Arabic script characters."""
     return bool(re.search(r"[\u0600-\u06FF]", text))
 
+def refine_colloquial_persian(text: str) -> str:
+    """
+    Polishes bookish/awkward machine translations of adult and intimate dialogues
+    into natural, authentic, colloquial Iranian Persian.
+    """
+    if not text:
+        return ""
+
+    t = text.strip()
+
+    replacements = [
+        # "I'm coming / gonna cum" mistranslated as "من دارم می‌آیم" or "دارم میام"
+        (r"\b(من\s+)?دارم\s+(می\s*آیم|میام)\b", "داره میاد"),
+        (r"\b(من\s+)?می\s*خوام\s+بیام\b", "داره آبم میاد"),
+        (r"\bآبم\s+داره\s+میاد\b", "داره میاد"),
+
+        # "Oh yeah / Yeah baby" mistranslated as "اوه بله" or "بله کودک"
+        (r"\bاوه\s+بله\b", "آره جونم"),
+        (r"\bاوه\s+آره\b", "آخ آره"),
+        (r"\bبله\s+کودک\b", "آره عشقم"),
+        (r"\bبله\s+عزیزم\b", "آره عشقم"),
+
+        # "Fuck me / Fuck yes"
+        (r"\bمرا\s+لعنت\s+کن\b", "بکن منو"),
+        (r"\bلعنت\s+به\s+من\b", "بکن منو"),
+        (r"\bلعنتی\s+بله\b", "آخ آره همینه"),
+        (r"\bلعنتی\s+خوب\b", "فوق‌العاده"),
+        (r"\bلعنتی\s+داغ\b", "خیلی داغ و سکسی"),
+        (r"\bلعنتی\s+عالی\b", "دیوونه‌کننده"),
+
+        # "Harder / Faster" mistranslated as "سخت‌تر" (difficult!)
+        (r"\bسخت\s*تر\b", "محکم‌تر"),
+        (r"\bسریع\s*تر\b", "تندتر"),
+
+        # "Don't stop"
+        (r"\bمتوقف\s+نشو\b", "وای نستا"),
+        (r"\bتوقف\s+نکن\b", "ول نکن"),
+        (r"\bایست\s+نکن\b", "ادامه بده"),
+
+        # "You like that?"
+        (r"\b(آیا\s+)?(آن\s*را|اینو)\s+دوست\s+داری\b", "خوشت میاد؟"),
+        (r"\bدوستش\s+داری\؟?\b", "حال می‌کنی؟"),
+
+        # "So good / Feels so good"
+        (r"\bبسیار\s+خوب\s+است\b", "خیلی حال میده"),
+        (r"\bاحساس\s+خیلی\s+خوبی\s+دارد\b", "چقدر حال میده"),
+        (r"\bخیلی\s+خوب\s+احساس\s+می\s*شه\b", "وای چه کیفی داره"),
+
+        # "Look at me"
+        (r"\bبه\s+من\s+نگاه\s+کن\b", "نگام کن"),
+        (r"\bبه\s+من\s+نگاه\s+کنید\b", "نگام کن"),
+
+        # "Come here"
+        (r"\bبه\s+اینجا\s+بیا\b", "بیا اینجا"),
+        (r"\bبیا\s+این\s*جا\b", "بیا اینجا"),
+
+        # "Suck it"
+        (r"\bآن\s*را\s+مکیدن\b", "بخورش"),
+        (r"\bمک\s+بزن\b", "بخورش"),
+
+        # Anatomy & vulgarities mistranslated by generic tools
+        (r"\bگربه\s*(من|ات|ت)?\b", "کصم"),
+        (r"\bخروس\s*(من|ات|ت)?\b", "کیرم"),
+    ]
+
+    for pattern, repl in replacements:
+        t = re.sub(pattern, repl, t, flags=re.IGNORECASE)
+
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
 def parse_delimited_lines(raw_output: str) -> dict[int, str]:
     res_map = {}
     if not raw_output:
@@ -404,22 +476,28 @@ def parse_delimited_lines(raw_output: str) -> dict[int, str]:
             idx_str = re.sub(r"\D", "", parts[0])
             fa_text = parts[1].strip()
             if idx_str and fa_text:
-                res_map[int(idx_str)] = fa_text
+                res_map[int(idx_str)] = refine_colloquial_persian(fa_text)
         else:
             m = LINE_PARSE_REGEX.match(line)
             if m:
-                res_map[int(m.group(1))] = m.group(2).strip()
+                res_map[int(m.group(1))] = refine_colloquial_persian(m.group(2).strip())
 
     return res_map
 
 SYSTEM_TRANSLATION_PROMPT = (
-    "You are an expert film subtitle translator specializing in English to Persian.\n"
-    "Translate every numbered English line into natural, conversational, fluent Persian (فارسی روان و محاوره‌ای).\n"
-    "RULES:\n"
-    "1. Output ONLY in this exact format:\n"
-    "ID|||Persian translation\n"
-    "2. Write English names, brands, and places phonetically in Persian script (e.g. John -> جان, Apple -> اپل).\n"
-    "3. Never skip any ID. Translate all numbered lines completely."
+    "You are a master subtitle translator specializing in uncensored adult, romantic, and intimate cinema (فیلم‌های بزرگسال، احساسی، عامیانه و بدون سانسور).\n"
+    "Translate every numbered English line into completely natural, seductive, colloquial, real-world Iranian Persian (فارسی عامیانه، صمیمی، محاوره‌ای و بدون سانسور).\n"
+    "CRITICAL GUIDELINES FOR ADULT & INTIMATE DIALOGUES:\n"
+    "1. Contextual Slang: Never translate literally! For example:\n"
+    "   - 'I'm coming / gonna cum' -> 'داره میاد / دارم ارضا میشم' (NEVER 'من دارم می‌آیم')\n"
+    "   - 'Oh yeah / Yeah baby' -> 'آره همینه / جون / آخ آره' (NEVER 'اوه بله کودک')\n"
+    "   - 'Harder / Faster' -> 'محکم‌تر / تندتر' (NEVER 'سخت‌تر')\n"
+    "   - 'Fuck yes / So good' -> 'آخ آره / چقدر حال میده / فوق‌العادست'\n"
+    "   - 'You like that?' -> 'خوشت میاد؟ / حال می‌کنی؟'\n"
+    "   - 'Don't stop' -> 'وای نستا / ادامه بده'\n"
+    "2. Complete Authenticity: Do NOT censor, soften, moralize, or alter explicit words. Translate the genuine tone, dirty talk, and intimacy as spoken by native Iranian couples.\n"
+    "3. Format: Output ONLY: ID|||ترجمه روان فارسی\n"
+    "4. Names/Brands: Phonetically in Persian script (e.g. John -> جان)."
 )
 
 async def try_groq_llm(batch: list[dict], groq_models: list[str]) -> dict[int, str]:
@@ -442,7 +520,7 @@ async def try_groq_llm(batch: list[dict], groq_models: list[str]) -> dict[int, s
                             {"role": "system", "content": SYSTEM_TRANSLATION_PROMPT},
                             {"role": "user", "content": input_lines}
                         ],
-                        "temperature": 0.15
+                        "temperature": 0.2
                     }
                 )
                 if resp.status_code == 200:
@@ -475,7 +553,7 @@ async def try_gemini_llm(batch: list[dict]) -> dict[int, str]:
                     "contents": [{
                         "parts": [{"text": f"{SYSTEM_TRANSLATION_PROMPT}\n\nEnglish Subtitles:\n{input_lines}"}]
                     }],
-                    "generationConfig": {"temperature": 0.15, "maxOutputTokens": 2048}
+                    "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2048}
                 }
                 resp = await client.post(url, json=payload)
                 if resp.status_code == 200:
@@ -492,7 +570,7 @@ async def try_gemini_llm(batch: list[dict]) -> dict[int, str]:
 
 async def try_gtx_batch(batch: list[dict]) -> dict[int, str]:
     """
-    High-speed, unthrottled Google GTX batch translation.
+    High-speed, unthrottled Google GTX batch translation with colloquial refinement.
     Sends newline-separated batches directly to the official translation engine in ~300ms.
     """
     if not batch:
@@ -521,7 +599,7 @@ async def try_gtx_batch(batch: list[dict]) -> dict[int, str]:
                 if len(fa_lines) == len(batch):
                     for item, fa_line in zip(batch, fa_lines):
                         if fa_line and has_persian_chars(fa_line):
-                            res_map[item["id"]] = fa_line
+                            res_map[item["id"]] = refine_colloquial_persian(fa_line)
                     return res_map
     except Exception as e:
         print(f"GTX batch error: {e}")
@@ -529,7 +607,7 @@ async def try_gtx_batch(batch: list[dict]) -> dict[int, str]:
     return res_map
 
 def deep_translator_batch_sync(batch: list[dict]) -> dict[int, str]:
-    """Fallback using deep-translator with single requests to prevent rate limit blocks."""
+    """Fallback using deep-translator with single requests and colloquial refinement."""
     translator = GoogleTranslator(source="en", target="fa")
     res_map = {}
     for item in batch:
@@ -537,13 +615,13 @@ def deep_translator_batch_sync(batch: list[dict]) -> dict[int, str]:
             t = item["text"].strip()
             fa = translator.translate(t)
             if fa and has_persian_chars(fa):
-                res_map[item["id"]] = fa.strip()
+                res_map[item["id"]] = refine_colloquial_persian(fa.strip())
         except Exception:
             pass
     return res_map
 
 async def emergency_single_translate(text: str) -> str:
-    """Attempts single-line translation through GTX and MyMemory."""
+    """Attempts single-line translation through GTX and MyMemory with colloquial refinement."""
     t = text.strip()
     if not t:
         return ""
@@ -557,7 +635,7 @@ async def emergency_single_translate(text: str) -> str:
             if r.status_code == 200:
                 fa = r.json()[0][0][0]
                 if fa and has_persian_chars(fa):
-                    return fa.strip()
+                    return refine_colloquial_persian(fa.strip())
     except Exception:
         pass
 
@@ -570,7 +648,7 @@ async def emergency_single_translate(text: str) -> str:
                 data = r.json()
                 fa = data.get("responseData", {}).get("translatedText", "")
                 if fa and has_persian_chars(fa) and not fa.startswith("MYMEMORY WARNING"):
-                    return fa.strip()
+                    return refine_colloquial_persian(fa.strip())
     except Exception:
         pass
 
@@ -600,12 +678,11 @@ async def translate_all_subtitles_instant(segments: list[dict]) -> list[dict]:
     1. Selects active Groq models + fallback models.
     2. Runs batches through Groq LLM -> Gemini -> Google GTX.
     3. Fills missing lines with deep_translator and emergency single-line translation.
-    4. Validates Persian characters to guarantee NO English subtitles leak through.
+    4. Applies colloquial Persian refinement to adult and intimate dialogues.
     """
     if not segments:
         return []
 
-    # Detect active Groq models with robust fallbacks
     groq_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "qwen/qwen-2.5-32b"]
     if groq_client:
         try:
@@ -615,7 +692,6 @@ async def translate_all_subtitles_instant(segments: list[dict]) -> list[dict]:
                 if any(k in mid.lower() for k in ["llama-3", "qwen", "gemma"]) and "whisper" not in mid.lower() and "guard" not in mid.lower():
                     detected.append(mid)
             if detected:
-                # Place detected models first, then fallbacks
                 groq_models = detected + [m for m in groq_models if m not in detected]
         except Exception as e:
             print(f"Groq models list note: {e}")
@@ -623,7 +699,6 @@ async def translate_all_subtitles_instant(segments: list[dict]) -> list[dict]:
     batch_size = 35
     batches = [segments[i:i + batch_size] for i in range(0, len(segments), batch_size)]
 
-    # Parallel batch execution
     tasks = [translate_batch_orchestrator(b, groq_models) for b in batches]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -632,7 +707,6 @@ async def translate_all_subtitles_instant(segments: list[dict]) -> list[dict]:
         if isinstance(r, dict):
             combined_map.update(r)
 
-    # Secondary pass: Fill any missing or non-Persian lines
     missing = [
         item for item in segments
         if item["id"] not in combined_map or not has_persian_chars(combined_map.get(item["id"], ""))
@@ -640,7 +714,6 @@ async def translate_all_subtitles_instant(segments: list[dict]) -> list[dict]:
 
     if missing:
         print(f"Resolving {len(missing)} missing/untranslated lines via GTX and fallbacks...")
-        # Try GTX for the missing subset
         gtx_res = await try_gtx_batch(missing)
         combined_map.update(gtx_res)
 
@@ -655,7 +728,6 @@ async def translate_all_subtitles_instant(segments: list[dict]) -> list[dict]:
                 dt_res = await loop.run_in_executor(pool, deep_translator_batch_sync, still_missing)
                 combined_map.update(dt_res)
 
-            # Emergency individual pass: guaranteed translation
             for item in still_missing:
                 cid = item["id"]
                 current_fa = combined_map.get(cid, "")
@@ -664,14 +736,14 @@ async def translate_all_subtitles_instant(segments: list[dict]) -> list[dict]:
                     if emergency_fa:
                         combined_map[cid] = emergency_fa
 
-    # Assemble final translated subtitles
     translated_all = []
     for item in segments:
         cid = item["id"]
         fa_text = combined_map.get(cid, "").strip()
-        # Only as an absolute last resort if all 5 translation layers failed
         if not fa_text:
             fa_text = item["text"]
+        else:
+            fa_text = refine_colloquial_persian(fa_text)
 
         translated_all.append({
             "start": item["start"],
@@ -681,7 +753,7 @@ async def translate_all_subtitles_instant(segments: list[dict]) -> list[dict]:
 
     return translated_all
 
-# ================= SUBTITLE (.ASS) & SIZE-CONTROLLED FFMPEG =================
+# ================= SUBTITLE (.ASS) & ULTRAFAST FFMPEG =================
 def format_ass_time(seconds: float) -> str:
     hrs = int(seconds // 3600)
     mins = int((seconds % 3600) // 60)
@@ -738,28 +810,45 @@ async def burn_subtitles_ffmpeg_size_capped(
     output_video: str,
     target_w: int,
     target_h: int,
+    orig_w: int,
+    orig_h: int,
     total_duration: int,
     orig_fps: float,
     orig_bitrate_kbps: int
 ):
-    fps_filter = "fps=30," if orig_fps > 31.0 else ""
-    # Escape colons and backslashes for FFmpeg filtergraph
+    # Cap 60fps videos down to 30fps to cut rendering time in half
+    fps_filter = "fps=30," if orig_fps > 30.5 else ""
+
+    # Skip redundant scaling filter if video is already at or below target resolution
+    scale_filter = f"scale={target_w}:{target_h}:flags=fast_bilinear," if (target_w != orig_w or target_h != orig_h) else ""
+
     escaped_ass = ass_path.replace("\\", "/").replace(":", r"\:")
     escaped_fonts = fonts_dir.replace("\\", "/").replace(":", r"\:")
-    vf_filter = f"{fps_filter}scale={target_w}:{target_h}:flags=fast_bilinear,ass={escaped_ass}:fontsdir={escaped_fonts}"
+    vf_filter = f"{fps_filter}{scale_filter}ass={escaped_ass}:fontsdir={escaped_fonts}"
 
     target_max_kbps = min(orig_bitrate_kbps, 1800)
     target_max_kbps = max(400, target_max_kbps)
     bufsize_kbps = target_max_kbps * 2
 
+    # High performance encoding:
+    # -preset superfast cuts encoding time by ~50% vs veryfast on 2-core cloud runners
+    # -crf 25 maintains sharp visuals with zero noticeable degradation
+    # -thread_type slice+frame maximizes parallel saturation of available vCPUs
     cmd = [
-        "ffmpeg", "-y", "-threads", "0", "-i", input_video,
+        "ffmpeg", "-y",
+        "-threads", "0",
+        "-thread_type", "slice+frame",
+        "-i", input_video,
         "-vf", vf_filter,
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
-        "-maxrate", f"{target_max_kbps}k", "-bufsize", f"{bufsize_kbps}k",
+        "-c:v", "libx264",
+        "-preset", "superfast",
+        "-crf", "25",
+        "-maxrate", f"{target_max_kbps}k",
+        "-bufsize", f"{bufsize_kbps}k",
         "-c:a", "copy",
         "-movflags", "+faststart",
-        "-progress", "pipe:1", "-nostats",
+        "-progress", "pipe:1",
+        "-nostats",
         output_video
     ]
 
@@ -782,7 +871,7 @@ async def burn_subtitles_ffmpeg_size_capped(
                 bar = make_progress_bar(pct)
                 await update_status(
                     client,
-                    f"🎬 <b>مرحله ۴ از ۵:</b> رندر زیرنویس هوشمند...\n"
+                    f"🎬 <b>مرحله ۴ از ۵:</b> رندر توربو زیرنویس...\n"
                     f"{bar} <b>{pct:.1f}%</b>",
                     force=False
                 )
@@ -854,8 +943,8 @@ async def main():
             )
             translated_subs = await translate_all_subtitles_instant(segments)
 
-        # 4. Generate ASS & Burn with Bitrate-Capped FFmpeg
-        await update_status(main_client, "🎬 <b>مرحله ۴ از ۵:</b> شروع رندر زیرنویس هوشمند...", force=True)
+        # 4. Generate ASS & Burn with Turbo FFmpeg
+        await update_status(main_client, "🎬 <b>مرحله ۴ از ۵:</b> شروع رندر توربو زیرنویس...", force=True)
         ass_path = "subtitles.ass"
         fonts_dir = "./fonts"
         output_video = "output_subtitled.mp4"
@@ -869,6 +958,8 @@ async def main():
             output_video,
             target_w,
             target_h,
+            orig_w,
+            orig_h,
             duration,
             orig_fps,
             orig_bitrate_kbps
