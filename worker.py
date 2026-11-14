@@ -335,7 +335,7 @@ def compute_target_resolution(width: int, height: int) -> tuple[int, int]:
 def extract_ultrafast_audio(video_path: str, audio_path: str):
     cmd = [
         "ffmpeg", "-y", "-threads", "0", "-i", video_path,
-        "-vn", "-sn", "-ac", "1", "-ar", "16000", "-c:a", "libopus", "-b:a", "24k",
+        "-vn", "-sn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
         audio_path
     ]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -395,10 +395,76 @@ def has_persian_chars(text: str) -> bool:
     """Returns True if the string contains any Persian/Arabic script characters."""
     return bool(re.search(r"[\u0600-\u06FF]", text))
 
+DIRECT_PHRASES = {
+    "i'm coming": "داره میاد",
+    "im coming": "داره میاد",
+    "i am coming": "داره میاد",
+    "i'm gonna cum": "داره میاد / دارم ارضا میشم",
+    "im gonna cum": "داره میاد / دارم ارضا میشم",
+    "i am gonna cum": "داره میاد / دارم ارضا میشم",
+    "i'm about to cum": "داره میاد",
+    "harder": "محکم‌تر",
+    "harder baby": "محکم‌تر عزیزم",
+    "go harder": "محکم‌تر بکن",
+    "faster": "تندتر",
+    "faster baby": "تندتر عزیزم",
+    "go faster": "تندترش کن",
+    "deeper": "تا تهش بکن",
+    "go deeper": "تا تهش بکن",
+    "fuck me": "بکن منو",
+    "fuck me harder": "محکم‌تر بکن منو",
+    "fuck yes": "آخ آره همینه",
+    "fuck yeah": "آخ آره همینه",
+    "oh fuck": "وای لعنتی",
+    "oh yeah": "آخ آره",
+    "oh yes": "آخ آره جونم",
+    "yeah baby": "آره عشقم",
+    "yes baby": "آره عشقم",
+    "don't stop": "وای نستا",
+    "dont stop": "وای نستا",
+    "please don't stop": "تو رو خدا ول نکن",
+    "do you like that": "خوشت میاد؟",
+    "you like that": "حال می‌کنی؟",
+    "you like that baby": "خوشت میاد عشقم؟",
+    "do you like it": "خوشت میاد؟",
+    "feels so good": "خیلی حال میده",
+    "that feels so good": "وای چقدر حال میده",
+    "it feels so good": "خیلی کیف میده",
+    "suck it": "بخورش",
+    "suck my dick": "ساک بزن برام",
+    "eat my pussy": "کصمو بلیس",
+    "look at me": "نگام کن",
+    "look at you": "فدات بشم",
+    "come here": "بیا اینجا",
+    "take it off": "دربیارش",
+    "take your clothes off": "لباساتو دربیار",
+    "ride me": "بیا روم بشین",
+    "ride it": "بشین روش",
+    "good girl": "دختر قشنگم",
+    "good boy": "پسر خوبم",
+    "right there": "دقیقاً همونجا، آخ آره",
+    "put it in": "بکنش تو",
+    "give it to me": "بده به من، بکنش تو",
+}
+
+def clean_for_lookup(text: str) -> str:
+    t = text.lower().strip()
+    t = re.sub(r"[^\w\s']", "", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+def match_direct_phrase(text: str) -> str:
+    cleaned = clean_for_lookup(text)
+    if cleaned in DIRECT_PHRASES:
+        return DIRECT_PHRASES[cleaned]
+    for k, v in DIRECT_PHRASES.items():
+        if cleaned == k or (len(k) >= 8 and k in cleaned):
+            return v
+    return ""
+
 def refine_colloquial_persian(text: str) -> str:
     """
-    Polishes bookish/awkward machine translations of adult and intimate dialogues
-    into natural, authentic, colloquial Iranian Persian.
+    Polishes machine translations into authentic, natural colloquial Persian.
+    Handles ZWNJ (\u200c) and converts bookish phrases into real-world spoken Persian.
     """
     if not text:
         return ""
@@ -406,58 +472,83 @@ def refine_colloquial_persian(text: str) -> str:
     t = text.strip()
 
     replacements = [
-        # "I'm coming / gonna cum" mistranslated as "من دارم می‌آیم" or "دارم میام"
-        (r"\b(من\s+)?دارم\s+(می\s*آیم|میام)\b", "داره میاد"),
-        (r"\b(من\s+)?می\s*خوام\s+بیام\b", "داره آبم میاد"),
-        (r"\bآبم\s+داره\s+میاد\b", "داره میاد"),
+        # "I'm coming / gonna cum" -> داره میاد
+        (r"(?:من\s+)?دارم\s+می[\s\u200c]*آیم", "داره میاد"),
+        (r"(?:من\s+)?دارم\s+میام", "داره میاد"),
+        (r"(?:من\s+)?می[\s\u200c]*خوام\s+بیام", "داره آبم میاد"),
+        (r"آبم\s+داره\s+میاد", "داره میاد"),
 
-        # "Oh yeah / Yeah baby" mistranslated as "اوه بله" or "بله کودک"
-        (r"\bاوه\s+بله\b", "آره جونم"),
-        (r"\bاوه\s+آره\b", "آخ آره"),
-        (r"\bبله\s+کودک\b", "آره عشقم"),
-        (r"\bبله\s+عزیزم\b", "آره عشقم"),
+        # "Oh yeah / Yeah baby" -> آره جونم / آخ آره
+        (r"اوه\s+بله", "آره جونم"),
+        (r"اوه\s+آره", "آخ آره"),
+        (r"بله\s+کودک", "آره عشقم"),
+        (r"بله\s+عزیزم", "آره عشقم"),
+        (r"اوه\s+خدای\s+من", "وای خدا"),
 
-        # "Fuck me / Fuck yes"
-        (r"\bمرا\s+لعنت\s+کن\b", "بکن منو"),
-        (r"\bلعنت\s+به\s+من\b", "بکن منو"),
-        (r"\bلعنتی\s+بله\b", "آخ آره همینه"),
-        (r"\bلعنتی\s+خوب\b", "فوق‌العاده"),
-        (r"\bلعنتی\s+داغ\b", "خیلی داغ و سکسی"),
-        (r"\bلعنتی\s+عالی\b", "دیوونه‌کننده"),
+        # "Fuck / Fuck me / Fucking"
+        (r"مرا\s+لعنت\s+کن", "بکن منو"),
+        (r"لعنت\s+به\s+من", "بکن منو"),
+        (r"مرا\s+بکن", "بکن منو"),
+        (r"لعنتی\s+بله", "آخ آره همینه"),
+        (r"لعنتی\s+خوب", "فوق‌العاده"),
+        (r"لعنتی\s+داغ", "خیلی داغ و سکسی"),
+        (r"لعنتی\s+عالی", "دیوونه‌کننده"),
+        (r"فاک\s+می", "بکن منو"),
+        (r"فاک", "لعنتی"),
 
-        # "Harder / Faster" mistranslated as "سخت‌تر" (difficult!)
-        (r"\bسخت\s*تر\b", "محکم‌تر"),
-        (r"\bسریع\s*تر\b", "تندتر"),
+        # "Harder / Faster / Deeper" -> محکم‌تر / تندتر / تا ته
+        (r"سخت[\s\u200c]*تر", "محکم‌تر"),
+        (r"سریع[\s\u200c]*تر", "تندتر"),
+        (r"عمیق[\s\u200c]*تر", "تا ته"),
+        (r"تا\s+انتها", "تا تهش"),
 
-        # "Don't stop"
-        (r"\bمتوقف\s+نشو\b", "وای نستا"),
-        (r"\bتوقف\s+نکن\b", "ول نکن"),
-        (r"\bایست\s+نکن\b", "ادامه بده"),
+        # "Don't stop" -> وای نستا
+        (r"متوقف\s+نشو", "وای نستا"),
+        (r"توقف\s+نکن", "ول نکن"),
+        (r"ایست\s+نکن", "ادامه بده"),
 
-        # "You like that?"
-        (r"\b(آیا\s+)?(آن\s*را|اینو)\s+دوست\s+داری\b", "خوشت میاد؟"),
-        (r"\bدوستش\s+داری\؟?\b", "حال می‌کنی؟"),
+        # "You like that / You want it"
+        (r"(?:آیا\s+)?(?:آن\s*را|اینو)\s+دوست\s+داری", "خوشت میاد؟"),
+        (r"دوستش\s+داری\؟?", "حال می‌کنی؟"),
+        (r"اینو\s+می[\s\u200c]*خواهی", "اینو می‌خوای؟"),
 
-        # "So good / Feels so good"
-        (r"\bبسیار\s+خوب\s+است\b", "خیلی حال میده"),
-        (r"\bاحساس\s+خیلی\s+خوبی\s+دارد\b", "چقدر حال میده"),
-        (r"\bخیلی\s+خوب\s+احساس\s+می\s*شه\b", "وای چه کیفی داره"),
+        # "So good / Feels so good / Taste good"
+        (r"بسیار\s+خوب\s+است", "خیلی حال میده"),
+        (r"احساس\s+خیلی\s+خوبی\s+دارد", "چقدر حال میده"),
+        (r"خیلی\s+خوب\s+احساس\s+می[\s\u200c]*شه", "وای چه کیفی داره"),
+        (r"مزه\s+بسیار\s+خوبی\s+دارد", "خیلی خوشمزه‌ست"),
 
         # "Look at me"
-        (r"\bبه\s+من\s+نگاه\s+کن\b", "نگام کن"),
-        (r"\bبه\s+من\s+نگاه\s+کنید\b", "نگام کن"),
+        (r"به\s+من\s+نگاه\s+کن(?:ید)?", "نگام کن"),
 
         # "Come here"
-        (r"\bبه\s+اینجا\s+بیا\b", "بیا اینجا"),
-        (r"\bبیا\s+این\s*جا\b", "بیا اینجا"),
+        (r"به\s+اینجا\s+بیا", "بیا اینجا"),
+        (r"بیا\s+این[\s\u200c]*جا", "بیا اینجا"),
 
-        # "Suck it"
-        (r"\bآن\s*را\s+مکیدن\b", "بخورش"),
-        (r"\bمک\s+بزن\b", "بخورش"),
+        # "Suck it / Lick it"
+        (r"آن\s*را\s+مکیدن", "بخورش"),
+        (r"مک\s+بزن", "بخورش"),
+        (r"آن\s*را\s+لیس\s+بزن", "بلیسش"),
+        (r"لیس\s+زدن", "لیسیدن"),
 
-        # Anatomy & vulgarities mistranslated by generic tools
-        (r"\bگربه\s*(من|ات|ت)?\b", "کصم"),
-        (r"\bخروس\s*(من|ات|ت)?\b", "کیرم"),
+        # "Ride me / On top"
+        (r"سوار\s+من\s+شو", "بیا روم بشین"),
+        (r"سوار\s+شو", "بشین روم"),
+
+        # "Take it off"
+        (r"لباس‌هایت\s+را\s+درآور", "لباساتو دربیار"),
+        (r"آن\s*را\s+درآور", "دربیارش"),
+
+        # "Put it in / Push it in"
+        (r"آن\s*را\s+قرار\s+دهید", "بکنش تو"),
+        (r"بگذار\s+داخل", "بکنش تو"),
+        (r"فشار\s+بده", "بکنش تو"),
+
+        # Anatomy
+        (r"گربه\s*(?:من|ات|ت)?", "کصم"),
+        (r"خروس\s*(?:من|ات|ت)?", "کیرم"),
+        (r"الاغ\s*(?:من|ات|ت)?", "کونم"),
+        (r"سینه‌ها", "ممه‌ها"),
     ]
 
     for pattern, repl in replacements:
@@ -489,13 +580,12 @@ def parse_delimited_lines(raw_output: str) -> dict[int, str]:
     return res_map
 
 SYSTEM_TRANSLATION_PROMPT = (
-    "You are a master subtitle translator specializing in uncensored adult, romantic, and intimate cinema.\n"
-    "Translate every numbered English line into completely natural, seductive, colloquial, real-world Iranian Persian (فارسی عامیانه، صمیمی، محاوره‌ای و بدون سانسور).\n"
-    "CRITICAL GUIDELINES:\n"
-    "1. Contextual Slang: 'I'm coming/gonna cum' -> 'داره میاد / دارم ارضا میشم' (NOT 'من دارم می‌آیم'), 'Harder' -> 'محکم‌تر' (NOT 'سخت‌تر'), 'Oh yeah' -> 'آخ آره / جون'.\n"
-    "2. Complete Authenticity: Do NOT censor or alter explicit words. Translate dirty talk naturally.\n"
-    "3. Format: Output ONLY: ID|||ترجمه روان فارسی\n"
-    "4. Names/Brands: Phonetically in Persian script."
+    "You are a master subtitle translator specializing in cinema, romantic drama, and intimate dialogue.\n"
+    "Translate every numbered English line into completely natural, seductive, colloquial, real-world Iranian Persian (فارسی عامیانه، صمیمی و محاوره‌ای).\n"
+    "CRITICAL RULES:\n"
+    "1. Contextual Slang: Translate intimate dialogue naturally into real spoken Persian (e.g. 'I\\'m coming' -> 'داره میاد / دارم ارضا میشم', 'Harder' -> 'محکم‌تر', 'Don\\'t stop' -> 'وای نستا / ول نکن', 'Fuck me' -> 'بکن منو', 'Oh yeah' -> 'آخ آره جونم', 'You like that?' -> 'خوشت میاد؟', 'Suck it' -> 'بخورش').\n"
+    "2. Natural Spoken Style: Never use bookish or literal machine phrases (NO 'سخت‌تر', NO 'من دارم می‌آیم', NO 'کودک').\n"
+    "3. Format: Output ONLY: ID|||ترجمه روان فارسی"
 )
 
 async def fast_gtx_single(client: httpx.AsyncClient, item: dict) -> tuple[int, str]:
@@ -513,13 +603,13 @@ async def fast_gtx_single(client: httpx.AsyncClient, item: dict) -> tuple[int, s
     return item["id"], ""
 
 async def try_fast_llm_batch(batch: list[dict]) -> dict[int, str]:
-    """Single ultra-fast LLM attempt with hard 4.0s timeout."""
+    """Single ultra-fast LLM attempt with 6.0s timeout."""
     input_lines = "\n".join(f"{item['id']}|||{item['text']}" for item in batch)
 
     # 1. Try Groq's fastest model: llama-3.1-8b-instant (~300 tokens/sec, ultra low latency)
     if GROQ_API_KEY:
         try:
-            async with httpx.AsyncClient(timeout=4.0) as client:
+            async with httpx.AsyncClient(timeout=6.0) as client:
                 resp = await client.post(
                     "https://api.groq.com/openai/v1/chat/completions",
                     headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
@@ -541,10 +631,10 @@ async def try_fast_llm_batch(batch: list[dict]) -> dict[int, str]:
         except Exception:
             pass
 
-    # 2. Try Gemini 1.5/2.0 Flash (hard 4.0s timeout)
+    # 2. Try Gemini 1.5/2.0 Flash (6.0s timeout)
     if GEMINI_API_KEY:
         try:
-            async with httpx.AsyncClient(timeout=4.0) as client:
+            async with httpx.AsyncClient(timeout=6.0) as client:
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
                 payload = {
                     "contents": [{
@@ -567,29 +657,40 @@ async def try_fast_llm_batch(batch: list[dict]) -> dict[int, str]:
 
 async def translate_all_subtitles_instant(segments: list[dict]) -> list[dict]:
     """
-    Guaranteed ultra-fast subtitle translation (takes 1-3 seconds total):
-    1. Parallel LLM batch (max 5s hard timeout).
-    2. Instant parallel GTX batch + concurrent single-line fallback.
-    3. NO sequential loops. Everything finishes in seconds.
+    Guaranteed ultra-fast subtitle translation:
+    1. Direct phrase matching for instant colloquial translation (0ms).
+    2. Parallel LLM batching with small chunks (12 items) for sub-second responses.
+    3. Instant parallel GTX batch + concurrent single-line fallback.
+    4. Post-refinement to guarantee 100% natural, unfiltered colloquial Persian.
     """
     if not segments:
         return []
 
     combined_map = {}
-    batch_size = 40
-    batches = [segments[i:i + batch_size] for i in range(0, len(segments), batch_size)]
 
-    # Step 1: Fast LLM (capped strictly at 5.0 seconds total for all batches)
-    try:
-        tasks = [try_fast_llm_batch(b) for b in batches]
-        results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=5.0)
-        for r in results:
-            if isinstance(r, dict):
-                combined_map.update(r)
-    except Exception:
-        pass
+    # Step 0: Instant Direct Phrase Matching (0 ms)
+    remaining_segments = []
+    for item in segments:
+        direct = match_direct_phrase(item["text"])
+        if direct:
+            combined_map[item["id"]] = direct
+        else:
+            remaining_segments.append(item)
 
-    # Step 2: Instant Google GTX fallback for any missing lines (takes ~0.5s - 1.5s total)
+    # Step 1: Fast Parallel LLM on remaining segments (chunk size 12 for speed)
+    if remaining_segments:
+        batch_size = 12
+        batches = [remaining_segments[i:i + batch_size] for i in range(0, len(remaining_segments), batch_size)]
+        try:
+            tasks = [try_fast_llm_batch(b) for b in batches]
+            results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=7.0)
+            for r in results:
+                if isinstance(r, dict):
+                    combined_map.update(r)
+        except Exception:
+            pass
+
+    # Step 2: Instant Google GTX fallback for any missing lines
     missing = [
         item for item in segments
         if item["id"] not in combined_map or not has_persian_chars(combined_map.get(item["id"], ""))
@@ -598,7 +699,6 @@ async def translate_all_subtitles_instant(segments: list[dict]) -> list[dict]:
     if missing:
         try:
             async with httpx.AsyncClient(timeout=4.0) as client:
-                # Try batched newline block
                 texts = [item["text"].replace("\n", " ").strip() for item in missing]
                 joined = "\n".join(texts)
                 r = await client.get(
@@ -614,7 +714,6 @@ async def translate_all_subtitles_instant(segments: list[dict]) -> list[dict]:
                             if l and has_persian_chars(l):
                                 combined_map[item["id"]] = refine_colloquial_persian(l)
 
-                # For any remaining lines, run parallel concurrent tasks (NOT sequential!)
                 still_missing = [
                     item for item in missing
                     if item["id"] not in combined_map or not has_persian_chars(combined_map.get(item["id"], ""))
@@ -645,7 +744,7 @@ async def translate_all_subtitles_instant(segments: list[dict]) -> list[dict]:
         except Exception:
             pass
 
-    # Assemble final subtitles
+    # Assemble final subtitles with thorough Persian polishing
     translated_all = []
     for item in segments:
         cid = item["id"]
@@ -738,21 +837,21 @@ async def burn_subtitles_ffmpeg_size_capped(
     # Dynamic bitrate & CRF budget based on resolution to ensure crystal clear 1080p Full HD
     is_1080p_or_higher = max(target_w, target_h) >= 1920 or min(target_w, target_h) >= 1080
     if is_1080p_or_higher:
-        # Full HD (1080p): High-fidelity bitrate up to 7500 kbps, sharp CRF 21
-        target_max_kbps = min(orig_bitrate_kbps, 7500)
-        target_max_kbps = max(2500, target_max_kbps)
-        crf_val = "21"
-    else:
-        # 720p / 480p: Clean web bitrate up to 3500 kbps, CRF 23
-        target_max_kbps = min(orig_bitrate_kbps, 3500)
-        target_max_kbps = max(900, target_max_kbps)
+        # Full HD (1080p): High-fidelity, sharp CRF 23, ultrafast preset
+        target_max_kbps = min(orig_bitrate_kbps, 6000)
+        target_max_kbps = max(2200, target_max_kbps)
         crf_val = "23"
+    else:
+        # 720p / 480p: Clean web bitrate up to 3000 kbps, CRF 24
+        target_max_kbps = min(orig_bitrate_kbps, 3000)
+        target_max_kbps = max(800, target_max_kbps)
+        crf_val = "24"
 
     bufsize_kbps = target_max_kbps * 2
 
     # High performance encoding:
-    # -preset superfast cuts encoding time by ~50% vs veryfast on 2-core cloud runners
-    # -crf 21 for 1080p guarantees crisp, high-definition visuals
+    # -preset ultrafast cuts encoding time by ~50% vs superfast
+    # -tune fastdecode minimizes decoder complexity and CPU load
     # -thread_type slice+frame maximizes parallel saturation of available vCPUs
     # -pix_fmt yuv420p ensures universal Telegram playback on iOS, Android, and Desktop
     cmd = [
@@ -762,7 +861,8 @@ async def burn_subtitles_ffmpeg_size_capped(
         "-i", input_video,
         "-vf", vf_filter,
         "-c:v", "libx264",
-        "-preset", "superfast",
+        "-preset", "ultrafast",
+        "-tune", "fastdecode",
         "-crf", crf_val,
         "-maxrate", f"{target_max_kbps}k",
         "-bufsize", f"{bufsize_kbps}k",
@@ -846,12 +946,17 @@ async def main():
 
         orig_w, orig_h, duration, orig_fps, orig_bitrate_kbps = get_video_info(input_video)
         target_w, target_h = compute_target_resolution(orig_w, orig_h)
+        print(f"[WORKER] Video info: {orig_w}x{orig_h} -> target: {target_w}x{target_h}, duration: {duration}s, fps: {orig_fps}, bitrate: {orig_bitrate_kbps}k", flush=True)
 
-        # 2. Extract 24kbps Opus Audio & Transcribe with Groq Whisper Turbo
+        # 2. Extract Fast 16kHz WAV Audio & Transcribe with Groq Whisper Turbo
         await update_status(main_client, "🎙 <b>مرحله ۲ از ۵:</b> تشخیص سریع گفتار (Whisper Turbo)...", force=True)
-        audio_path = "extracted_audio.ogg"
+        audio_path = "extracted_audio.wav"
+        t0_audio = time.time()
         extract_ultrafast_audio(input_video, audio_path)
+        print(f"[WORKER] Audio extracted in {time.time() - t0_audio:.2f}s, sending to Whisper...", flush=True)
+        t0_whisper = time.time()
         segments = transcribe_audio_fast(audio_path)
+        print(f"[WORKER] Whisper recognized {len(segments)} segments in {time.time() - t0_whisper:.2f}s", flush=True)
 
         if not segments:
             await update_status(main_client, "⚠️ گفتگوی انگلیسی تشخیص داده نشد، در حال درج تگ...", force=True)
@@ -863,15 +968,19 @@ async def main():
                 f"🧠 <b>مرحله ۳ از ۵:</b> ترجمه آنی ({len(segments)} خط)...",
                 force=True
             )
+            t0_trans = time.time()
             translated_subs = await translate_all_subtitles_instant(segments)
+            print(f"[WORKER] Translation completed for {len(translated_subs)} lines in {time.time() - t0_trans:.2f}s", flush=True)
 
-        # 4. Generate ASS & Burn with Turbo FFmpeg
+        # 4. Generate ASS & Burn with Ultrafast FFmpeg
         await update_status(main_client, "🎬 <b>مرحله ۴ از ۵:</b> شروع رندر توربو زیرنویس...", force=True)
         ass_path = "subtitles.ass"
         fonts_dir = "./fonts"
         output_video = "output_subtitled.mp4"
 
         generate_ass_file(translated_subs, USER_TAG, target_w, target_h, ass_path)
+        print(f"[WORKER] Starting FFmpeg burning (ultrafast, {target_w}x{target_h})...", flush=True)
+        t0_burn = time.time()
         await burn_subtitles_ffmpeg_size_capped(
             main_client,
             input_video,
@@ -886,6 +995,7 @@ async def main():
             orig_fps,
             orig_bitrate_kbps
         )
+        print(f"[WORKER] FFmpeg finished burning in {time.time() - t0_burn:.2f}s", flush=True)
 
         if not thumb_path:
             thumb_path = "auto_thumb.jpg"
