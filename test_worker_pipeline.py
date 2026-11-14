@@ -23,4 +23,4 @@ async def run_integration_tests():
 
     # 1080p vertical (Reels / TikTok / Stories) must NOT be downscaled!
     w1080_vert, h1080_vert = compute_target_resolution(1080, 1920)
-    assert (w1080_vert, h1080_vert) == (1080, 1920), f"1
+    assert (w1080_vert, h1080_vert) == (1080, 1920), f"1080p vertical degraded! Got {w1080_vert}x{h1080_ve
