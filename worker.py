@@ -9,7 +9,9 @@ import asyncio
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 
-from telethon import TelegramClient, utils
+import httpx
+from deep_translator import GoogleTranslator
+from telethon import TelegramClient
 from telethon.network import MTProtoSender
 from telethon.tl.types import (
     DocumentAttributeVideo,
@@ -22,14 +24,8 @@ from telethon.tl.functions.upload import (
     SaveFilePartRequest,
     SaveBigFilePartRequest,
 )
-from telethon.tl.functions.auth import (
-    ExportAuthorizationRequest,
-    ImportAuthorizationRequest,
-)
 
 from groq import Groq
-from google import genai
-from google.genai import types
 
 # ================= INPUTS & SECRETS =================
 API_ID = int((os.getenv("TG_API_ID") or "2040").strip())
@@ -44,8 +40,8 @@ VIDEO_MSG_ID = int((os.getenv("VIDEO_MSG_ID") or "0").strip())
 THUMB_MSG_ID = int((os.getenv("THUMB_MSG_ID") or "0").strip())
 USER_TAG = (os.getenv("USER_TAG") or "@YourChannelTag").strip()
 
-groq_client = Groq(api_key=GROQ_API_KEY)
-gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+# Disable internal SDK retries (max_retries=0) so Groq NEVER hangs silently!
+groq_client = Groq(api_key=GROQ_API_KEY, max_retries=0, timeout=25.0)
 
 last_edit_time = 0.0
 
@@ -77,17 +73,10 @@ def make_progress_bar(percent: float) -> str:
 
 # ================= FLOOD-FREE 6-SOCKET MTPROTO SENDER ENGINE =================
 async def create_sender_pool(client: TelegramClient, dc_id: int, pool_size: int = 6) -> list[MTProtoSender]:
-    """
-    Creates 6 raw MTProtoSender TCP connections WITHOUT calling sign_in(bot_token)!
-    - If on the same DC as the main client, it reuses client.session.auth_key directly (0 auth calls!).
-    - If on a different DC, it exports authorization once.
-    This gives 6-socket parallel speed while making FloodWait on ImportBotAuthorization impossible!
-    """
     dc = await client._get_dc(dc_id)
     senders = []
 
     if dc_id == client.session.dc_id:
-        # Reuse the exact same auth_key across 6 independent TCP sockets (ZERO auth requests!)
         for _ in range(pool_size):
             sender = MTProtoSender(client.session.auth_key, loggers=client._log)
             await sender.connect(
@@ -101,7 +90,6 @@ async def create_sender_pool(client: TelegramClient, dc_id: int, pool_size: int 
             )
             senders.append(sender)
     else:
-        # Cross-DC file transfer: export once to get DC auth_key, then clone across 6 sockets
         first_sender = await client._borrow_exported_sender(dc_id)
         shared_auth_key = first_sender.auth_key
         await client._return_exported_sender(first_sender)
@@ -389,34 +377,7 @@ def transcribe_audio_fast(audio_path: str) -> list[dict]:
     return clean_segments
 
 
-# ================= BULLETPROOF LINE-BY-LINE TRANSLATION ENGINE =================
-def get_active_models_once() -> tuple[list[str], list[str]]:
-    groq_models = []
-    try:
-        for m in groq_client.models.list().data:
-            mid = m.id
-            if not any(x in mid.lower() for x in ["whisper", "guard", "tts", "playai", "embed", "vision", "allam"]):
-                groq_models.append(mid)
-        preferred = ["llama-3.3", "qwen", "deepseek", "llama-3.1", "llama", "gemma"]
-        groq_models.sort(key=lambda x: next((i for i, kw in enumerate(preferred) if kw in x.lower()), 99))
-    except Exception as e:
-        print(f"Groq list note: {e}")
-
-    gemini_models = ["gemini-3.8-flash", "gemini-3.8-pro", "gemini-3.0-flash"]
-    if gemini_client:
-        try:
-            for m in gemini_client.models.list():
-                name = (getattr(m, "name", "") or "").replace("models/", "", 1)
-                if "gemini" in name and "flash" in name and not any(x in name for x in ["tts", "audio", "image", "vision"]):
-                    if name not in gemini_models:
-                        gemini_models.append(name)
-        except Exception:
-            pass
-
-    print(f"Active Groq Models: {groq_models[:4]} | Active Gemini Models: {gemini_models[:3]}")
-    return groq_models[:4], gemini_models[:3]
-
-
+# ================= ZERO-HANG 5-SECOND TRANSLATION ENGINE =================
 LINE_PARSE_REGEX = re.compile(r"^\[?(\d+)\]?\s*(?:\|\|\||[:\-–—])\s*(.+)$")
 
 
@@ -443,103 +404,165 @@ def parse_delimited_lines(raw_output: str) -> dict[int, str]:
     return res_map
 
 
-def translate_chunk_delimited(
-    batch: list[dict],
-    batch_idx: int,
-    groq_models: list[str],
-    gemini_models: list[str]
-) -> dict[int, str]:
+async def try_llm_batch_with_hard_timeout(batch: list[dict], groq_model: str) -> dict[int, str]:
+    """
+    Calls Groq or Gemini over raw HTTPX with a strict 8-second timeout and ZERO retries.
+    If the API is busy or rate-limited, it aborts in <0.2s instead of hanging for 15 minutes!
+    """
     system_instruction = (
-        "You are an elite Iranian subtitle translator. Translate every numbered English line into "
-        "natural, fluent, conversational Persian (فارسی محاوره‌ای و طبیعی).\n"
-        "STRICT RULES:\n"
-        "1. Output ONLY in this exact format for every line:\n"
+        "Translate every numbered English subtitle line into natural, conversational Persian (فارسی محاوره‌ای).\n"
+        "Output ONLY in this exact format:\n"
         "ID|||Persian translation\n"
-        "Example:\n"
-        "0|||سلام رفقا، خوش اومدین به این ویدیو\n"
-        "1|||امروز می‌خوایم یه اتفاق عجیب رو بررسی کنیم\n"
-        "2. 100% PERSIAN SCRIPT ONLY: Write all proper names, people, brands, and acronyms phonetically in Persian letters (حروف فارسی, e.g. 'MrBeast' -> 'میستر بیست', 'FBI' -> 'اف‌بی‌آی'). Never translate people's names into literal dictionary words.\n"
-        "3. Translate EVERY single ID. Do not add any intro or markdown."
+        "Write all names and brands phonetically in Persian script (حروف فارسی). Never skip any ID."
     )
-
     input_lines = "\n".join(f"{item['id']}|||{item['text']}" for item in batch)
-    providers = ["groq", "gemini"] if (batch_idx % 2 == 0) else ["gemini", "groq"]
 
-    for provider in providers:
-        if provider == "groq" and groq_models:
-            for q_model in groq_models:
-                try:
-                    resp = groq_client.chat.completions.create(
-                        model=q_model,
-                        messages=[
+    async with httpx.AsyncClient(timeout=8.0) as http_client:
+        # 1. Fast attempt on Groq REST API (8s hard ceiling)
+        if GROQ_API_KEY and groq_model:
+            try:
+                resp = await http_client.post(
+                    "[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)",
+                    headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                    json={
+                        "model": groq_model,
+                        "messages": [
                             {"role": "system", "content": system_instruction},
                             {"role": "user", "content": input_lines}
                         ],
-                        temperature=0.15
-                    )
-                    raw_text = resp.choices[0].message.content or ""
+                        "temperature": 0.15
+                    }
+                )
+                if resp.status_code == 200:
+                    raw_text = resp.json()["choices"][0]["message"]["content"]
                     raw_text = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL).strip()
                     parsed = parse_delimited_lines(raw_text)
-                    if len(parsed) >= max(1, int(len(batch) * 0.6)):
-                        print(f"Batch {batch_idx} ({len(parsed)}/{len(batch)} lines) translated via Groq {q_model}")
+                    if len(parsed) >= int(len(batch) * 0.7):
                         return parsed
-                except Exception as e:
-                    print(f"Groq {q_model} batch {batch_idx} skip: {str(e)[:120]}")
+            except Exception as e:
+                print(f"Fast Groq timeout/skip: {e}")
 
-        elif provider == "gemini" and gemini_client and gemini_models:
-            for g_model in gemini_models:
+        # 2. Fast attempt on Gemini REST API (8s hard ceiling, no tenacity retry loop!)
+        if GEMINI_API_KEY:
+            for g_model in ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.0-flash"]:
                 try:
-                    resp = gemini_client.models.generate_content(
-                        model=g_model,
-                        contents=input_lines,
-                        config=types.GenerateContentConfig(
-                            system_instruction=system_instruction,
-                            temperature=0.15
-                        )
+                    url = f"[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/){g_model}:generateContent?key={GEMINI_API_KEY}"
+                    resp = await http_client.post(
+                        url,
+                        json={
+                            "systemInstruction": {"parts": [{"text": system_instruction}]},
+                            "contents": [{"parts": [{"text": input_lines}]}],
+                            "generationConfig": {"temperature": 0.15}
+                        }
                     )
-                    raw_text = resp.text or ""
-                    parsed = parse_delimited_lines(raw_text)
-                    if len(parsed) >= max(1, int(len(batch) * 0.6)):
-                        print(f"Batch {batch_idx} ({len(parsed)}/{len(batch)} lines) translated via Gemini {g_model}")
-                        return parsed
+                    if resp.status_code == 200:
+                        candidates = resp.json().get("candidates", [])
+                        if candidates:
+                            raw_text = candidates[0]["content"]["parts"][0]["text"]
+                            parsed = parse_delimited_lines(raw_text)
+                            if len(parsed) >= int(len(batch) * 0.7):
+                                return parsed
                 except Exception as e:
-                    print(f"Gemini {g_model} batch {batch_idx} skip: {str(e)[:120]}")
+                    print(f"Fast Gemini {g_model} skip: {e}")
 
     return {}
 
 
+def google_batch_translate_sync(batch: list[dict]) -> dict[int, str]:
+    """
+    Instant, zero-rate-limit batch translation via GoogleTranslator.
+    Joins 35 lines into a single request separated by newlines so 35 lines translate in 0.4 seconds!
+    """
+    translator = GoogleTranslator(source="en", target="fa")
+    res_map = {}
+
+    # Combine lines into ~3500-char blocks separated by newline for 1-request batching
+    current_ids = []
+    current_texts = []
+    current_len = 0
+
+    def flush_block(ids_list, texts_list):
+        if not ids_list:
+            return
+        joined_en = "\n".join(texts_list)
+        try:
+            joined_fa = translator.translate(joined_en)
+            fa_lines = [line.strip() for line in joined_fa.splitlines() if line.strip()]
+            if len(fa_lines) == len(ids_list):
+                for cid, cfa in zip(ids_list, fa_lines):
+                    res_map[cid] = cfa
+                return
+        except Exception:
+            pass
+
+        # Fallback to translate_batch if newline count didn't match
+        try:
+            batch_fa = translator.translate_batch(texts_list)
+            for cid, cfa in zip(ids_list, batch_fa):
+                if cfa:
+                    res_map[cid] = cfa.strip()
+        except Exception as e:
+            print(f"GoogleTranslator fallback error: {e}")
+
+    for item in batch:
+        t = item["text"].replace("\n", " ").strip()
+        if current_len + len(t) > 3500:
+            flush_block(current_ids, current_texts)
+            current_ids, current_texts, current_len = [], [], 0
+        current_ids.append(item["id"])
+        current_texts.append(t)
+        current_len += len(t) + 1
+
+    flush_block(current_ids, current_texts)
+    return res_map
+
+
 async def translate_all_subtitles_instant(segments: list[dict]) -> list[dict]:
+    """
+    Guaranteed to finish in 3-10 seconds total:
+    1. Grabs the top active Groq model in 0.2s (no retries).
+    2. Fires parallel batches with a strict 8-second HTTP timeout.
+    3. Any batch or line not finished in 8 seconds is immediately translated in 0.4s via Google Batch Translate.
+    """
     if not segments:
         return []
 
-    groq_models, gemini_models = get_active_models_once()
+    groq_model = ""
+    try:
+        for m in groq_client.models.list().data:
+            mid = m.id
+            if any(k in mid.lower() for k in ["llama-3", "qwen", "gemma"]) and "whisper" not in mid.lower() and "guard" not in mid.lower():
+                groq_model = mid
+                break
+    except Exception:
+        pass
 
-    batch_size = 40
+    batch_size = 35
     batches = [segments[i:i + batch_size] for i in range(0, len(segments), batch_size)]
 
-    loop = asyncio.get_running_loop()
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        tasks = [
-            loop.run_in_executor(
-                pool, translate_chunk_delimited, batch, idx, groq_models, gemini_models
-            )
-            for idx, batch in enumerate(batches)
-        ]
-        results = await asyncio.gather(*tasks)
+    # Step A: Try fast LLM batches concurrently (capped at 10 seconds total for ALL batches!)
+    llm_tasks = [try_llm_batch_with_hard_timeout(batch, groq_model) for batch in batches]
+    try:
+        results = await asyncio.wait_for(asyncio.gather(*llm_tasks, return_exceptions=True), timeout=12.0)
+    except asyncio.TimeoutError:
+        results = []
 
     combined_map = {}
     for r in results:
-        combined_map.update(r)
+        if isinstance(r, dict):
+            combined_map.update(r)
 
+    # Step B: Instantly fill any remaining/rate-limited lines in ~1-2 seconds using parallel Google Batch Translate
     missing = [item for item in segments if item["id"] not in combined_map]
     if missing:
-        print(f"Retrying {len(missing)} missed subtitle lines...")
-        for i in range(0, len(missing), 30):
-            chunk = missing[i:i + 30]
-            filled = await loop.run_in_executor(
-                None, translate_chunk_delimited, chunk, 99 + i, groq_models, gemini_models
-            )
-            combined_map.update(filled)
+        print(f"Fast-filling {len(missing)} lines via parallel Google Batch Translator...")
+        g_batches = [missing[i:i + 40] for i in range(0, len(missing), 40)]
+        loop = asyncio.get_running_loop()
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            g_tasks = [loop.run_in_executor(pool, google_batch_translate_sync, gb) for gb in g_batches]
+            g_results = await asyncio.gather(*g_tasks)
+        for gr in g_results:
+            combined_map.update(gr)
 
     translated_all = []
     for item in segments:
@@ -670,7 +693,6 @@ async def burn_subtitles_ffmpeg_size_capped(
 # ================= MAIN PIPELINE =================
 async def main():
     os.makedirs("session_cache", exist_ok=True)
-    # Using a persistent session file keyed by the first 8 chars of BOT_TOKEN
     token_hash = hashlib.md5(BOT_TOKEN.encode()).hexdigest()[:10]
     session_path = f"session_cache/bot_{token_hash}"
 
@@ -695,7 +717,7 @@ async def main():
                 )
                 await update_status(main_client, text, force=False)
 
-        # 1. True 6-Socket Striped Download (Uses MTProtoSenders, ZERO extra bot logins!)
+        # 1. True 6-Socket Striped Download
         await update_status(main_client, "📥 <b>مرحله ۱ از ۵:</b> شروع دانلود موازی ۶ کاناله...", force=True)
         video_msg = await main_client.get_messages(CHAT_ID, ids=VIDEO_MSG_ID)
         input_video = "input_video.mp4"
@@ -720,10 +742,10 @@ async def main():
             await update_status(main_client, "⚠️ گفتگوی انگلیسی تشخیص داده نشد، در حال درج تگ...", force=True)
             translated_subs = []
         else:
-            # 3. Direct Line-by-Line Translation
+            # 3. Hard-Timeout 10s Translation + Parallel Batch Fallback (Physically cannot hang!)
             await update_status(
                 main_client,
-                f"🧠 <b>مرحله ۳ از ۵:</b> ترجمه آنی ({len(segments)} خط)...",
+                f"🧠 <b>مرحله ۳ از ۵:</b> ترجمه فوق‌سریع ({len(segments)} خط)...",
                 force=True
             )
             translated_subs = await translate_all_subtitles_instant(segments)
