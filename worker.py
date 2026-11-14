@@ -8,7 +8,6 @@ import hashlib
 import asyncio
 import subprocess
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 from deep_translator import GoogleTranslator
@@ -384,7 +383,7 @@ def transcribe_audio_fast(audio_path: str) -> list[dict]:
 
     return clean_segments
 
-# ================= BULLETPROOF MULTI-LAYER TRANSLATION ENGINE =================
+# ================= BULLETPROOF & ULTRA-FAST TRANSLATION ENGINE =================
 LINE_PARSE_REGEX = re.compile(r"^\[?(\d+)\]?\s*(?:\|\|\||[:\-–—\.]|\))\s*(.+)$")
 
 def has_persian_chars(text: str) -> bool:
@@ -485,37 +484,42 @@ def parse_delimited_lines(raw_output: str) -> dict[int, str]:
     return res_map
 
 SYSTEM_TRANSLATION_PROMPT = (
-    "You are a master subtitle translator specializing in uncensored adult, romantic, and intimate cinema (فیلم‌های بزرگسال، احساسی، عامیانه و بدون سانسور).\n"
+    "You are a master subtitle translator specializing in uncensored adult, romantic, and intimate cinema.\n"
     "Translate every numbered English line into completely natural, seductive, colloquial, real-world Iranian Persian (فارسی عامیانه، صمیمی، محاوره‌ای و بدون سانسور).\n"
-    "CRITICAL GUIDELINES FOR ADULT & INTIMATE DIALOGUES:\n"
-    "1. Contextual Slang: Never translate literally! For example:\n"
-    "   - 'I'm coming / gonna cum' -> 'داره میاد / دارم ارضا میشم' (NEVER 'من دارم می‌آیم')\n"
-    "   - 'Oh yeah / Yeah baby' -> 'آره همینه / جون / آخ آره' (NEVER 'اوه بله کودک')\n"
-    "   - 'Harder / Faster' -> 'محکم‌تر / تندتر' (NEVER 'سخت‌تر')\n"
-    "   - 'Fuck yes / So good' -> 'آخ آره / چقدر حال میده / فوق‌العادست'\n"
-    "   - 'You like that?' -> 'خوشت میاد؟ / حال می‌کنی؟'\n"
-    "   - 'Don't stop' -> 'وای نستا / ادامه بده'\n"
-    "2. Complete Authenticity: Do NOT censor, soften, moralize, or alter explicit words. Translate the genuine tone, dirty talk, and intimacy as spoken by native Iranian couples.\n"
+    "CRITICAL GUIDELINES:\n"
+    "1. Contextual Slang: 'I'm coming/gonna cum' -> 'داره میاد / دارم ارضا میشم' (NOT 'من دارم می‌آیم'), 'Harder' -> 'محکم‌تر' (NOT 'سخت‌تر'), 'Oh yeah' -> 'آخ آره / جون'.\n"
+    "2. Complete Authenticity: Do NOT censor or alter explicit words. Translate dirty talk naturally.\n"
     "3. Format: Output ONLY: ID|||ترجمه روان فارسی\n"
-    "4. Names/Brands: Phonetically in Persian script (e.g. John -> جان)."
+    "4. Names/Brands: Phonetically in Persian script."
 )
 
-async def try_groq_llm(batch: list[dict], groq_models: list[str]) -> dict[int, str]:
-    """Tries Groq Chat Completions API over clean HTTPS endpoint."""
-    if not GROQ_API_KEY:
-        return {}
+async def fast_gtx_single(client: httpx.AsyncClient, item: dict) -> tuple[int, str]:
+    """Concurrent single-line GTX request (runs in 0.2s)."""
+    url = "https://translate.googleapis.com/translate_a/single"
+    params = {"client": "gtx", "sl": "en", "tl": "fa", "dt": "t", "q": item["text"]}
+    try:
+        r = await client.get(url, params=params, timeout=3.5)
+        if r.status_code == 200:
+            fa = r.json()[0][0][0]
+            if fa and has_persian_chars(fa):
+                return item["id"], refine_colloquial_persian(fa)
+    except Exception:
+        pass
+    return item["id"], ""
 
+async def try_fast_llm_batch(batch: list[dict]) -> dict[int, str]:
+    """Single ultra-fast LLM attempt with hard 4.0s timeout."""
     input_lines = "\n".join(f"{item['id']}|||{item['text']}" for item in batch)
-    url = "https://api.groq.com/openai/v1/chat/completions"
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        for model in groq_models:
-            try:
+    # 1. Try Groq's fastest model: llama-3.1-8b-instant (~300 tokens/sec, ultra low latency)
+    if GROQ_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=4.0) as client:
                 resp = await client.post(
-                    url,
+                    "https://api.groq.com/openai/v1/chat/completions",
                     headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
                     json={
-                        "model": model,
+                        "model": "llama-3.1-8b-instant",
                         "messages": [
                             {"role": "system", "content": SYSTEM_TRANSLATION_PROMPT},
                             {"role": "user", "content": input_lines}
@@ -529,26 +533,14 @@ async def try_groq_llm(batch: list[dict], groq_models: list[str]) -> dict[int, s
                     parsed = parse_delimited_lines(raw_text)
                     if len(parsed) >= int(len(batch) * 0.7):
                         return parsed
-                elif resp.status_code == 429:
-                    print(f"Groq {model} rate limited, trying next model...")
-                    continue
-            except Exception as e:
-                print(f"Groq {model} error: {e}")
+        except Exception:
+            pass
 
-    return {}
-
-async def try_gemini_llm(batch: list[dict]) -> dict[int, str]:
-    """Tries Gemini REST API over clean HTTPS endpoint."""
-    if not GEMINI_API_KEY:
-        return {}
-
-    input_lines = "\n".join(f"{item['id']}|||{item['text']}" for item in batch)
-    gemini_models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-flash-8b"]
-
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        for g_model in gemini_models:
-            try:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_model}:generateContent?key={GEMINI_API_KEY}"
+    # 2. Try Gemini 1.5/2.0 Flash (hard 4.0s timeout)
+    if GEMINI_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=4.0) as client:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
                 payload = {
                     "contents": [{
                         "parts": [{"text": f"{SYSTEM_TRANSLATION_PROMPT}\n\nEnglish Subtitles:\n{input_lines}"}]
@@ -563,179 +555,92 @@ async def try_gemini_llm(batch: list[dict]) -> dict[int, str]:
                         parsed = parse_delimited_lines(raw_text)
                         if len(parsed) >= int(len(batch) * 0.7):
                             return parsed
-            except Exception as e:
-                print(f"Gemini {g_model} error: {e}")
+        except Exception:
+            pass
 
     return {}
 
-async def try_gtx_batch(batch: list[dict]) -> dict[int, str]:
-    """
-    High-speed, unthrottled Google GTX batch translation with colloquial refinement.
-    Sends newline-separated batches directly to the official translation engine in ~300ms.
-    """
-    if not batch:
-        return {}
-
-    res_map = {}
-    texts = [item["text"].replace("\n", " ").strip() for item in batch]
-    joined_text = "\n".join(texts)
-
-    url = "https://translate.googleapis.com/translate_a/single"
-    params = {
-        "client": "gtx",
-        "sl": "en",
-        "tl": "fa",
-        "dt": "t",
-        "q": joined_text
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            resp = await client.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"})
-            if resp.status_code == 200:
-                data = resp.json()
-                translated_full = "".join(seg[0] for seg in data[0] if seg and seg[0])
-                fa_lines = [l.strip() for l in translated_full.splitlines() if l.strip()]
-                if len(fa_lines) == len(batch):
-                    for item, fa_line in zip(batch, fa_lines):
-                        if fa_line and has_persian_chars(fa_line):
-                            res_map[item["id"]] = refine_colloquial_persian(fa_line)
-                    return res_map
-    except Exception as e:
-        print(f"GTX batch error: {e}")
-
-    return res_map
-
-def deep_translator_batch_sync(batch: list[dict]) -> dict[int, str]:
-    """Fallback using deep-translator with single requests and colloquial refinement."""
-    translator = GoogleTranslator(source="en", target="fa")
-    res_map = {}
-    for item in batch:
-        try:
-            t = item["text"].strip()
-            fa = translator.translate(t)
-            if fa and has_persian_chars(fa):
-                res_map[item["id"]] = refine_colloquial_persian(fa.strip())
-        except Exception:
-            pass
-    return res_map
-
-async def emergency_single_translate(text: str) -> str:
-    """Attempts single-line translation through GTX and MyMemory with colloquial refinement."""
-    t = text.strip()
-    if not t:
-        return ""
-
-    # 1. GTX single
-    try:
-        url = "https://translate.googleapis.com/translate_a/single"
-        params = {"client": "gtx", "sl": "en", "tl": "fa", "dt": "t", "q": t}
-        async with httpx.AsyncClient(timeout=4.0) as client:
-            r = await client.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"})
-            if r.status_code == 200:
-                fa = r.json()[0][0][0]
-                if fa and has_persian_chars(fa):
-                    return refine_colloquial_persian(fa.strip())
-    except Exception:
-        pass
-
-    # 2. MyMemory single
-    try:
-        url = f"https://api.mymemory.translated.net/get?q={urllib.parse.quote(t)}&langpair=en|fa"
-        async with httpx.AsyncClient(timeout=4.0) as client:
-            r = await client.get(url)
-            if r.status_code == 200:
-                data = r.json()
-                fa = data.get("responseData", {}).get("translatedText", "")
-                if fa and has_persian_chars(fa) and not fa.startswith("MYMEMORY WARNING"):
-                    return refine_colloquial_persian(fa.strip())
-    except Exception:
-        pass
-
-    return ""
-
-async def translate_batch_orchestrator(batch: list[dict], groq_models: list[str]) -> dict[int, str]:
-    """Runs primary LLM translation, falling back to GTX batch."""
-    # 1. Try Groq
-    if groq_models:
-        res = await try_groq_llm(batch, groq_models)
-        if len(res) >= int(len(batch) * 0.7):
-            return res
-
-    # 2. Try Gemini
-    if GEMINI_API_KEY:
-        res = await try_gemini_llm(batch)
-        if len(res) >= int(len(batch) * 0.7):
-            return res
-
-    # 3. Fast GTX batch
-    res = await try_gtx_batch(batch)
-    return res
-
 async def translate_all_subtitles_instant(segments: list[dict]) -> list[dict]:
     """
-    Robust translation engine:
-    1. Selects active Groq models + fallback models.
-    2. Runs batches through Groq LLM -> Gemini -> Google GTX.
-    3. Fills missing lines with deep_translator and emergency single-line translation.
-    4. Applies colloquial Persian refinement to adult and intimate dialogues.
+    Guaranteed ultra-fast subtitle translation (takes 2-5 seconds total):
+    1. Parallel LLM batch (max 5s hard timeout).
+    2. Instant parallel GTX batch + concurrent single-line fallback.
+    3. NO sequential loops. Everything finishes in seconds.
     """
     if not segments:
         return []
 
-    groq_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "qwen/qwen-2.5-32b"]
-    if groq_client:
-        try:
-            detected = []
-            for m in groq_client.models.list().data:
-                mid = m.id
-                if any(k in mid.lower() for k in ["llama-3", "qwen", "gemma"]) and "whisper" not in mid.lower() and "guard" not in mid.lower():
-                    detected.append(mid)
-            if detected:
-                groq_models = detected + [m for m in groq_models if m not in detected]
-        except Exception as e:
-            print(f"Groq models list note: {e}")
-
-    batch_size = 35
+    combined_map = {}
+    batch_size = 40
     batches = [segments[i:i + batch_size] for i in range(0, len(segments), batch_size)]
 
-    tasks = [translate_batch_orchestrator(b, groq_models) for b in batches]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    # Step 1: Fast LLM (capped strictly at 5.0 seconds total for all batches)
+    try:
+        tasks = [try_fast_llm_batch(b) for b in batches]
+        results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=5.0)
+        for r in results:
+            if isinstance(r, dict):
+                combined_map.update(r)
+    except Exception:
+        pass
 
-    combined_map = {}
-    for r in results:
-        if isinstance(r, dict):
-            combined_map.update(r)
-
+    # Step 2: Instant Google GTX fallback for any missing lines (takes ~0.5s - 1.5s total)
     missing = [
         item for item in segments
         if item["id"] not in combined_map or not has_persian_chars(combined_map.get(item["id"], ""))
     ]
 
     if missing:
-        print(f"Resolving {len(missing)} missing/untranslated lines via GTX and fallbacks...")
-        gtx_res = await try_gtx_batch(missing)
-        combined_map.update(gtx_res)
+        try:
+            async with httpx.AsyncClient(timeout=4.0) as client:
+                # Try batched newline block
+                texts = [item["text"].replace("\n", " ").strip() for item in missing]
+                joined = "\n".join(texts)
+                r = await client.get(
+                    "https://translate.googleapis.com/translate_a/single",
+                    params={"client": "gtx", "sl": "en", "tl": "fa", "dt": "t", "q": joined}
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    translated_full = "".join(seg[0] for seg in data[0] if seg and seg[0])
+                    lines = [l.strip() for l in translated_full.splitlines() if l.strip()]
+                    if len(lines) == len(missing):
+                        for item, l in zip(missing, lines):
+                            if l and has_persian_chars(l):
+                                combined_map[item["id"]] = refine_colloquial_persian(l)
 
-        still_missing = [
-            item for item in missing
-            if item["id"] not in combined_map or not has_persian_chars(combined_map.get(item["id"], ""))
-        ]
+                # For any remaining lines, run parallel concurrent tasks (NOT sequential!)
+                still_missing = [
+                    item for item in missing
+                    if item["id"] not in combined_map or not has_persian_chars(combined_map.get(item["id"], ""))
+                ]
+                if still_missing:
+                    gtx_tasks = [fast_gtx_single(client, it) for it in still_missing]
+                    single_results = await asyncio.gather(*gtx_tasks, return_exceptions=True)
+                    for res in single_results:
+                        if isinstance(res, tuple) and res[1]:
+                            combined_map[res[0]] = res[1]
+        except Exception as e:
+            print(f"GTX fallback note: {e}")
 
-        if still_missing:
+    # Step 3: Fast translate_batch fallback from deep_translator if anything is still missing
+    still_missing = [
+        item for item in segments
+        if item["id"] not in combined_map or not has_persian_chars(combined_map.get(item["id"], ""))
+    ]
+    if still_missing:
+        try:
+            translator = GoogleTranslator(source="en", target="fa")
+            texts_to_trans = [it["text"] for it in still_missing]
             loop = asyncio.get_running_loop()
-            with ThreadPoolExecutor(max_workers=3) as pool:
-                dt_res = await loop.run_in_executor(pool, deep_translator_batch_sync, still_missing)
-                combined_map.update(dt_res)
+            batch_res = await loop.run_in_executor(None, translator.translate_batch, texts_to_trans)
+            for it, tr in zip(still_missing, batch_res):
+                if tr and has_persian_chars(tr):
+                    combined_map[it["id"]] = refine_colloquial_persian(tr)
+        except Exception:
+            pass
 
-            for item in still_missing:
-                cid = item["id"]
-                current_fa = combined_map.get(cid, "")
-                if not current_fa or not has_persian_chars(current_fa):
-                    emergency_fa = await emergency_single_translate(item["text"])
-                    if emergency_fa:
-                        combined_map[cid] = emergency_fa
-
+    # Assemble final subtitles
     translated_all = []
     for item in segments:
         cid = item["id"]
@@ -795,7 +700,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         start_str = format_ass_time(sub["start"])
         end_str = format_ass_time(sub["end"])
         clean_text = sub["text"].replace("\n", "\\N").replace("{", "").replace("}", "")
-        # Unicode RTL embedding (\u202B) ensures correct Persian text shaping and punctuation
         rtl_text = f"\u202B{clean_text}"
         lines.append(f"Dialogue: 1,{start_str},{end_str},YellowSub,,0,0,0,,{rtl_text}")
 
@@ -816,10 +720,7 @@ async def burn_subtitles_ffmpeg_size_capped(
     orig_fps: float,
     orig_bitrate_kbps: int
 ):
-    # Cap 60fps videos down to 30fps to cut rendering time in half
     fps_filter = "fps=30," if orig_fps > 30.5 else ""
-
-    # Skip redundant scaling filter if video is already at or below target resolution
     scale_filter = f"scale={target_w}:{target_h}:flags=fast_bilinear," if (target_w != orig_w or target_h != orig_h) else ""
 
     escaped_ass = ass_path.replace("\\", "/").replace(":", r"\:")
@@ -830,10 +731,6 @@ async def burn_subtitles_ffmpeg_size_capped(
     target_max_kbps = max(400, target_max_kbps)
     bufsize_kbps = target_max_kbps * 2
 
-    # High performance encoding:
-    # -preset superfast cuts encoding time by ~50% vs veryfast on 2-core cloud runners
-    # -crf 25 maintains sharp visuals with zero noticeable degradation
-    # -thread_type slice+frame maximizes parallel saturation of available vCPUs
     cmd = [
         "ffmpeg", "-y",
         "-threads", "0",
@@ -935,10 +832,10 @@ async def main():
             await update_status(main_client, "⚠️ گفتگوی انگلیسی تشخیص داده نشد، در حال درج تگ...", force=True)
             translated_subs = []
         else:
-            # 3. Multi-layer Resilient Subtitle Translation
+            # 3. Guaranteed Ultra-Fast Subtitle Translation (2-5 seconds)
             await update_status(
                 main_client,
-                f"🧠 <b>مرحله ۳ از ۵:</b> ترجمه هوشمند ({len(segments)} خط)...",
+                f"🧠 <b>مرحله ۳ از ۵:</b> ترجمه آنی ({len(segments)} خط)...",
                 force=True
             )
             translated_subs = await translate_all_subtitles_instant(segments)

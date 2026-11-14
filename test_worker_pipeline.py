@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import asyncio
 import subprocess
 
@@ -7,9 +8,6 @@ from worker import (
     has_persian_chars,
     refine_colloquial_persian,
     parse_delimited_lines,
-    try_groq_llm,
-    try_gemini_llm,
-    try_gtx_batch,
     translate_all_subtitles_instant,
     generate_ass_file,
     compute_target_resolution,
@@ -28,15 +26,20 @@ async def run_integration_tests():
         sys.stdout.buffer.write((f"  Raw: {inp} -> Refined: {res}\n").encode("utf-8"))
         assert has_persian_chars(res)
 
-    print("\n=== STEP 2: Live Adult & Intimate Translation Verification ===")
+    print("\n=== STEP 2: Live Speed & Translation Verification ===")
     adult_test_segments = [
         {"id": 0, "start": 0.0, "end": 2.5, "text": "Oh yeah, that feels so good baby."},
         {"id": 1, "start": 2.5, "end": 5.0, "text": "Harder, please don't stop right now."},
         {"id": 2, "start": 5.0, "end": 8.0, "text": "Look at me, you like that? I'm gonna cum."}
     ]
 
+    t0 = time.time()
     translated = await translate_all_subtitles_instant(adult_test_segments)
-    print(f"Translated {len(translated)} adult segments:")
+    elapsed = time.time() - t0
+    print(f"Translation completed in: {elapsed:.2f} seconds!")
+    assert elapsed < 7.0, f"Translation took too long: {elapsed:.2f}s"
+
+    print(f"Translated {len(translated)} segments:")
     for s in translated:
         has_fa = has_persian_chars(s['text'])
         sys.stdout.buffer.write((f"  [{s['start']}s -> {s['end']}s]: {s['text']} (Persian: {has_fa})\n").encode("utf-8"))
@@ -54,15 +57,13 @@ async def run_integration_tests():
     print("ASS file generated and validated successfully.")
 
     print("\n=== STEP 4: Scaling Logic Verification ===")
-    # 720p source should not rescale
     w720, h720 = compute_target_resolution(1280, 720)
-    assert (w720, h720) == (1280, 720), f"Expected 1280x720, got {w720}x{h720}"
-    # 1080p source should scale down to 720p to save encoding CPU
+    assert (w720, h720) == (1280, 720)
     w1080, h1080 = compute_target_resolution(1920, 1080)
-    assert (w1080, h1080) == (1280, 720), f"Expected 1280x720, got {w1080}x{h1080}"
+    assert (w1080, h1080) == (1280, 720)
     print("Resolution & scaling logic validated successfully.")
 
-    print("\n=== ALL INTEGRATION TESTS PASSED WITH 100% COLLOQUIAL ACCURACY ===")
+    print("\n=== ALL INTEGRATION TESTS PASSED WITH LIGHTNING SPEED ===")
 
 if __name__ == "__main__":
     asyncio.run(run_integration_tests())
