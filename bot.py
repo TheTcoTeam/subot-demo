@@ -1,4 +1,5 @@
 import os
+import html
 import asyncio
 import aiohttp
 from aiohttp import web
@@ -17,6 +18,7 @@ GH_OWNER = os.getenv("GH_OWNER")              # Your GitHub username
 GH_REPO = os.getenv("GH_REPO")                # Your GitHub repository name
 DEFAULT_TAG = os.getenv("DEFAULT_TAG", "@YourChannelTag")
 PORT = int(os.getenv("PORT", 10000))
+RENDER_URL = os.getenv("RENDER_EXTERNAL_URL") or f"https://{GH_REPO}.onrender.com"
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -50,13 +52,15 @@ def build_panel_keyboard(session: dict) -> InlineKeyboardMarkup:
     ])
 
 def build_panel_text(session: dict, file_name: str = "ویدیوی ارسالی") -> str:
+    safe_name = html.escape(file_name)
+    safe_tag = html.escape(session['tag'])
     thumb_status = "✅ دریافت شده" if session["thumb_msg_id"] else "➖ بدون تامنیل سفارشی"
     return (
         "💎 <b>پنل هوشمند زیرنویس و ادیت ویدیو (نسخه دمو)</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"📹 <b>فایل ویدیو:</b> <code>{file_name}</code>\n"
+        f"📹 <b>فایل ویدیو:</b> <code>{safe_name}</code>\n"
         f"🖼 <b>کاور (تامنیل):</b> {thumb_status}\n"
-        f"🏷 <b>تگ پایین ویدیو:</b> <code>{session['tag']}</code>\n"
+        f"🏷 <b>تگ پایین ویدیو:</b> <code>{safe_tag}</code>\n"
         "🎨 <b>استایل زیرنویس:</b> فونت فارسی زرد (سینمایی هماهنگ با صدا)\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "👇 در صورت تمایل تامنیل یا تگ را تغییر دهید، یا مستقیم دکمه <b>شروع</b> را بزنید:"
@@ -119,13 +123,14 @@ async def handle_text(message: Message):
     if session.get("awaiting_input") == "tag":
         session["tag"] = message.text.strip()[:40]
         session["awaiting_input"] = None
+        safe_tag = html.escape(session['tag'])
         if session["video_msg_id"]:
             await message.reply(
-                f"✅ تگ شما به <code>{session['tag']}</code> تغییر یافت!\n\n" + build_panel_text(session),
+                f"✅ تگ شما به <code>{safe_tag}</code> تغییر یافت!\n\n" + build_panel_text(session),
                 reply_markup=build_panel_keyboard(session)
             )
         else:
-            await message.reply(f"✅ تگ <code>{session['tag']}</code> ذخیره شد. اکنون ویدیو را بفرستید.")
+            await message.reply(f"✅ تگ <code>{safe_tag}</code> ذخیره شد. اکنون ویدیو را بفرستید.")
     else:
         await message.reply("📥 لطفاً یک <b>ویدیو</b> ارسال یا فوروارد کنید تا پنل تنظیمات باز شود.")
 
@@ -203,14 +208,34 @@ async def trigger_github_workflow(chat_id: int, status_msg_id: int, video_msg_id
             "user_tag": user_tag
         }
     }
-    async with aiohttp.ClientSession() as http_session:
-        async with http_session.post(url, json=payload, headers=headers) as resp:
-            return resp.status == 204
+    try:
+        async with aiohttp.ClientSession() as http_session:
+            async with http_session.post(url, json=payload, headers=headers) as resp:
+                if resp.status != 204:
+                    body = await resp.text()
+                    print(f"[Workflow Dispatch Error] HTTP {resp.status}: {body}")
+                    return False
+                return True
+    except Exception as e:
+        print(f"[Workflow Dispatch Exception] {e}")
+        return False
 
 # ================= RENDER KEEP-ALIVE WEB SERVER =================
 
 async def health_check(request):
     return web.Response(text="Bot is alive and running!")
+
+async def render_keep_awake():
+    """Periodically pings the Render public endpoint every 10 minutes to prevent free dyno sleep."""
+    await asyncio.sleep(120)
+    while True:
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+                async with session.get(RENDER_URL) as r:
+                    print(f"[Keep-Awake] Pinged {RENDER_URL} -> HTTP {r.status}")
+        except Exception as e:
+            print(f"[Keep-Awake] Note: {e}")
+        await asyncio.sleep(600)
 
 async def main():
     app = web.Application()
@@ -220,6 +245,8 @@ async def main():
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
     print(f"Keep-alive server started on port {PORT}")
+
+    asyncio.create_task(render_keep_awake())
 
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)

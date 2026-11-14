@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*$py.class
+session_cache/
+*.mp4
+*.ogg
+*.ass
+*.jpg
+*.png
+.env
+.venv

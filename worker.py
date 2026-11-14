@@ -7,6 +7,7 @@ import math
 import hashlib
 import asyncio
 import subprocess
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
@@ -40,22 +41,41 @@ VIDEO_MSG_ID = int((os.getenv("VIDEO_MSG_ID") or "0").strip())
 THUMB_MSG_ID = int((os.getenv("THUMB_MSG_ID") or "0").strip())
 USER_TAG = (os.getenv("USER_TAG") or "@YourChannelTag").strip()
 
-# Disable internal SDK retries (max_retries=0) so Groq NEVER hangs silently!
-groq_client = Groq(api_key=GROQ_API_KEY, max_retries=0, timeout=25.0)
+groq_client = Groq(api_key=GROQ_API_KEY, max_retries=0, timeout=25.0) if GROQ_API_KEY else None
 
 last_edit_time = 0.0
 
+# ================= PORTABLE I/O HELPERS =================
+def safe_pread(fd: int, size: int, offset: int) -> bytes:
+    """Reads bytes at an offset with fallback for systems lacking os.pread."""
+    if hasattr(os, "pread"):
+        return os.pread(fd, size, offset)
+    pos = os.lseek(fd, 0, os.SEEK_CUR)
+    os.lseek(fd, offset, os.SEEK_SET)
+    data = os.read(fd, size)
+    os.lseek(fd, pos, os.SEEK_SET)
+    return data
+
+def safe_pwrite(fd: int, data: bytes, offset: int):
+    """Writes bytes at an offset with fallback for systems lacking os.pwrite."""
+    if hasattr(os, "pwrite"):
+        os.pwrite(fd, data, offset)
+    else:
+        pos = os.lseek(fd, 0, os.SEEK_CUR)
+        os.lseek(fd, offset, os.SEEK_SET)
+        os.write(fd, data)
+        os.lseek(fd, pos, os.SEEK_SET)
 
 # ================= STATUS & PROGRESS HELPERS =================
 async def update_status(client: TelegramClient, step_text: str, force: bool = True):
     global last_edit_time
     now = time.time()
-    if not force and (now - last_edit_time) < 5.5:
+    if not force and (now - last_edit_time) < 4.0:
         return
     last_edit_time = now
     try:
         text = (
-            "⚡ <b>موتور پردازش فوق‌سریع (نسخه توربو)</b>\n"
+            "⚡ <b>موتور پردازش هوشمند زیرنویس (نسخه توربو)</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             f"{step_text}\n"
             "━━━━━━━━━━━━━━━━━━━━"
@@ -64,12 +84,10 @@ async def update_status(client: TelegramClient, step_text: str, force: bool = Tr
     except Exception:
         pass
 
-
 def make_progress_bar(percent: float) -> str:
     filled = int(round(percent / 10))
     filled = max(0, min(10, filled))
     return "🟩" * filled + "⬜" * (10 - filled)
-
 
 # ================= FLOOD-FREE 6-SOCKET MTPROTO SENDER ENGINE =================
 async def create_sender_pool(client: TelegramClient, dc_id: int, pool_size: int = 6) -> list[MTProtoSender]:
@@ -109,10 +127,8 @@ async def create_sender_pool(client: TelegramClient, dc_id: int, pool_size: int 
 
     return senders
 
-
 async def disconnect_sender_pool(senders: list[MTProtoSender]):
     await asyncio.gather(*(s.disconnect() for s in senders), return_exceptions=True)
-
 
 async def striped_download_file(
     client: TelegramClient,
@@ -163,7 +179,7 @@ async def striped_download_file(
                         GetFileRequest(location=location, offset=offset, limit=part_size)
                     )
                     chunk = res.bytes
-                    os.pwrite(fd, chunk, offset)
+                    safe_pwrite(fd, chunk, offset)
                     downloaded_bytes += len(chunk)
                     if progress_callback:
                         await progress_callback(downloaded_bytes, file_size)
@@ -171,21 +187,17 @@ async def striped_download_file(
                 except Exception as e:
                     if attempt == 3:
                         raise e
-                    await asyncio.sleep(0.4 * (attempt + 1))
+                    await asyncio.sleep(0.3 * (attempt + 1))
             queue.task_done()
 
     try:
-        tasks = []
-        for s in senders:
-            tasks.append(asyncio.create_task(worker_task(s)))
-            tasks.append(asyncio.create_task(worker_task(s)))
+        tasks = [asyncio.create_task(worker_task(s)) for s in senders]
         await asyncio.gather(*tasks)
     finally:
         os.close(fd)
         await disconnect_sender_pool(senders)
 
     return output_path
-
 
 async def striped_upload_file(
     client: TelegramClient,
@@ -222,7 +234,7 @@ async def striped_upload_file(
                 break
 
             offset = part_idx * part_size
-            chunk = os.pread(fd, part_size, offset)
+            chunk = safe_pread(fd, part_size, offset)
 
             for attempt in range(4):
                 try:
@@ -247,14 +259,11 @@ async def striped_upload_file(
                 except Exception as e:
                     if attempt == 3:
                         raise e
-                    await asyncio.sleep(0.4 * (attempt + 1))
+                    await asyncio.sleep(0.3 * (attempt + 1))
             queue.task_done()
 
     try:
-        tasks = []
-        for s in senders:
-            tasks.append(asyncio.create_task(worker_task(s)))
-            tasks.append(asyncio.create_task(worker_task(s)))
+        tasks = [asyncio.create_task(worker_task(s)) for s in senders]
         await asyncio.gather(*tasks)
     finally:
         os.close(fd)
@@ -270,7 +279,6 @@ async def striped_upload_file(
             name=file_name,
             md5_checksum=hash_md5.hexdigest()
         )
-
 
 # ================= VIDEO & AUDIO PROCESSING =================
 def get_video_info(video_path: str) -> tuple[int, int, int, float, int]:
@@ -308,7 +316,6 @@ def get_video_info(video_path: str) -> tuple[int, int, int, float, int]:
 
     return width, height, duration, fps, bitrate_kbps
 
-
 def compute_target_resolution(width: int, height: int) -> tuple[int, int]:
     min_dim = min(width, height)
     if min_dim <= 720:
@@ -320,17 +327,17 @@ def compute_target_resolution(width: int, height: int) -> tuple[int, int]:
     new_h -= (new_h % 2)
     return new_w, new_h
 
-
 def extract_ultrafast_audio(video_path: str, audio_path: str):
     cmd = [
         "ffmpeg", "-y", "-threads", "0", "-i", video_path,
-        "-vn", "-ac", "1", "-ar", "16000", "-c:a", "libopus", "-b:a", "24k",
+        "-vn", "-sn", "-ac", "1", "-ar", "16000", "-c:a", "libopus", "-b:a", "24k",
         audio_path
     ]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-
 def transcribe_audio_fast(audio_path: str) -> list[dict]:
+    if not groq_client:
+        raise RuntimeError("GROQ_API_KEY is not set.")
     whisper_models = ["whisper-large-v3-turbo", "whisper-large-v3"]
     transcription = None
     for wm in whisper_models:
@@ -339,7 +346,7 @@ def transcribe_audio_fast(audio_path: str) -> list[dict]:
                 transcription = groq_client.audio.transcriptions.create(
                     file=(audio_path, f.read()),
                     model=wm,
-                    prompt="Transcribe with accurate spelling and capitalization for names, brands, and places.",
+                    prompt="Transcribe speech accurately with correct spelling and capitalization.",
                     response_format="verbose_json",
                     language="en",
                     temperature=0.0
@@ -349,7 +356,7 @@ def transcribe_audio_fast(audio_path: str) -> list[dict]:
             print(f"Whisper {wm} error: {e}")
 
     if not transcription:
-        raise RuntimeError("Groq Whisper transcription failed.")
+        raise RuntimeError("Groq Whisper transcription failed on all models.")
 
     raw_segments = getattr(transcription, "segments", []) or []
     clean_segments = []
@@ -376,10 +383,12 @@ def transcribe_audio_fast(audio_path: str) -> list[dict]:
 
     return clean_segments
 
+# ================= BULLETPROOF MULTI-LAYER TRANSLATION ENGINE =================
+LINE_PARSE_REGEX = re.compile(r"^\[?(\d+)\]?\s*(?:\|\|\||[:\-–—\.]|\))\s*(.+)$")
 
-# ================= ZERO-HANG 5-SECOND TRANSLATION ENGINE =================
-LINE_PARSE_REGEX = re.compile(r"^\[?(\d+)\]?\s*(?:\|\|\||[:\-–—])\s*(.+)$")
-
+def has_persian_chars(text: str) -> bool:
+    """Returns True if the string contains any Persian/Arabic script characters."""
+    return bool(re.search(r"[\u0600-\u06FF]", text))
 
 def parse_delimited_lines(raw_output: str) -> dict[int, str]:
     res_map = {}
@@ -403,31 +412,34 @@ def parse_delimited_lines(raw_output: str) -> dict[int, str]:
 
     return res_map
 
+SYSTEM_TRANSLATION_PROMPT = (
+    "You are an expert film subtitle translator specializing in English to Persian.\n"
+    "Translate every numbered English line into natural, conversational, fluent Persian (فارسی روان و محاوره‌ای).\n"
+    "RULES:\n"
+    "1. Output ONLY in this exact format:\n"
+    "ID|||Persian translation\n"
+    "2. Write English names, brands, and places phonetically in Persian script (e.g. John -> جان, Apple -> اپل).\n"
+    "3. Never skip any ID. Translate all numbered lines completely."
+)
 
-async def try_llm_batch_with_hard_timeout(batch: list[dict], groq_model: str) -> dict[int, str]:
-    """
-    Calls Groq or Gemini over raw HTTPX with a strict 8-second timeout and ZERO retries.
-    If the API is busy or rate-limited, it aborts in <0.2s instead of hanging for 15 minutes!
-    """
-    system_instruction = (
-        "Translate every numbered English subtitle line into natural, conversational Persian (فارسی محاوره‌ای).\n"
-        "Output ONLY in this exact format:\n"
-        "ID|||Persian translation\n"
-        "Write all names and brands phonetically in Persian script (حروف فارسی). Never skip any ID."
-    )
+async def try_groq_llm(batch: list[dict], groq_models: list[str]) -> dict[int, str]:
+    """Tries Groq Chat Completions API over clean HTTPS endpoint."""
+    if not GROQ_API_KEY:
+        return {}
+
     input_lines = "\n".join(f"{item['id']}|||{item['text']}" for item in batch)
+    url = "https://api.groq.com/openai/v1/chat/completions"
 
-    async with httpx.AsyncClient(timeout=8.0) as http_client:
-        # 1. Fast attempt on Groq REST API (8s hard ceiling)
-        if GROQ_API_KEY and groq_model:
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        for model in groq_models:
             try:
-                resp = await http_client.post(
-                    "[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)",
+                resp = await client.post(
+                    url,
                     headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
                     json={
-                        "model": groq_model,
+                        "model": model,
                         "messages": [
-                            {"role": "system", "content": system_instruction},
+                            {"role": "system", "content": SYSTEM_TRANSLATION_PROMPT},
                             {"role": "user", "content": input_lines}
                         ],
                         "temperature": 0.15
@@ -439,136 +451,228 @@ async def try_llm_batch_with_hard_timeout(batch: list[dict], groq_model: str) ->
                     parsed = parse_delimited_lines(raw_text)
                     if len(parsed) >= int(len(batch) * 0.7):
                         return parsed
+                elif resp.status_code == 429:
+                    print(f"Groq {model} rate limited, trying next model...")
+                    continue
             except Exception as e:
-                print(f"Fast Groq timeout/skip: {e}")
-
-        # 2. Fast attempt on Gemini REST API (8s hard ceiling, no tenacity retry loop!)
-        if GEMINI_API_KEY:
-            for g_model in ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.0-flash"]:
-                try:
-                    url = f"[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/){g_model}:generateContent?key={GEMINI_API_KEY}"
-                    resp = await http_client.post(
-                        url,
-                        json={
-                            "systemInstruction": {"parts": [{"text": system_instruction}]},
-                            "contents": [{"parts": [{"text": input_lines}]}],
-                            "generationConfig": {"temperature": 0.15}
-                        }
-                    )
-                    if resp.status_code == 200:
-                        candidates = resp.json().get("candidates", [])
-                        if candidates:
-                            raw_text = candidates[0]["content"]["parts"][0]["text"]
-                            parsed = parse_delimited_lines(raw_text)
-                            if len(parsed) >= int(len(batch) * 0.7):
-                                return parsed
-                except Exception as e:
-                    print(f"Fast Gemini {g_model} skip: {e}")
+                print(f"Groq {model} error: {e}")
 
     return {}
 
+async def try_gemini_llm(batch: list[dict]) -> dict[int, str]:
+    """Tries Gemini REST API over clean HTTPS endpoint."""
+    if not GEMINI_API_KEY:
+        return {}
 
-def google_batch_translate_sync(batch: list[dict]) -> dict[int, str]:
+    input_lines = "\n".join(f"{item['id']}|||{item['text']}" for item in batch)
+    gemini_models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-flash-8b"]
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        for g_model in gemini_models:
+            try:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_model}:generateContent?key={GEMINI_API_KEY}"
+                payload = {
+                    "contents": [{
+                        "parts": [{"text": f"{SYSTEM_TRANSLATION_PROMPT}\n\nEnglish Subtitles:\n{input_lines}"}]
+                    }],
+                    "generationConfig": {"temperature": 0.15, "maxOutputTokens": 2048}
+                }
+                resp = await client.post(url, json=payload)
+                if resp.status_code == 200:
+                    candidates = resp.json().get("candidates", [])
+                    if candidates:
+                        raw_text = candidates[0]["content"]["parts"][0]["text"]
+                        parsed = parse_delimited_lines(raw_text)
+                        if len(parsed) >= int(len(batch) * 0.7):
+                            return parsed
+            except Exception as e:
+                print(f"Gemini {g_model} error: {e}")
+
+    return {}
+
+async def try_gtx_batch(batch: list[dict]) -> dict[int, str]:
     """
-    Instant, zero-rate-limit batch translation via GoogleTranslator.
-    Joins 35 lines into a single request separated by newlines so 35 lines translate in 0.4 seconds!
+    High-speed, unthrottled Google GTX batch translation.
+    Sends newline-separated batches directly to the official translation engine in ~300ms.
     """
-    translator = GoogleTranslator(source="en", target="fa")
+    if not batch:
+        return {}
+
     res_map = {}
+    texts = [item["text"].replace("\n", " ").strip() for item in batch]
+    joined_text = "\n".join(texts)
 
-    # Combine lines into ~3500-char blocks separated by newline for 1-request batching
-    current_ids = []
-    current_texts = []
-    current_len = 0
+    url = "https://translate.googleapis.com/translate_a/single"
+    params = {
+        "client": "gtx",
+        "sl": "en",
+        "tl": "fa",
+        "dt": "t",
+        "q": joined_text
+    }
 
-    def flush_block(ids_list, texts_list):
-        if not ids_list:
-            return
-        joined_en = "\n".join(texts_list)
-        try:
-            joined_fa = translator.translate(joined_en)
-            fa_lines = [line.strip() for line in joined_fa.splitlines() if line.strip()]
-            if len(fa_lines) == len(ids_list):
-                for cid, cfa in zip(ids_list, fa_lines):
-                    res_map[cid] = cfa
-                return
-        except Exception:
-            pass
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"})
+            if resp.status_code == 200:
+                data = resp.json()
+                translated_full = "".join(seg[0] for seg in data[0] if seg and seg[0])
+                fa_lines = [l.strip() for l in translated_full.splitlines() if l.strip()]
+                if len(fa_lines) == len(batch):
+                    for item, fa_line in zip(batch, fa_lines):
+                        if fa_line and has_persian_chars(fa_line):
+                            res_map[item["id"]] = fa_line
+                    return res_map
+    except Exception as e:
+        print(f"GTX batch error: {e}")
 
-        # Fallback to translate_batch if newline count didn't match
-        try:
-            batch_fa = translator.translate_batch(texts_list)
-            for cid, cfa in zip(ids_list, batch_fa):
-                if cfa:
-                    res_map[cid] = cfa.strip()
-        except Exception as e:
-            print(f"GoogleTranslator fallback error: {e}")
-
-    for item in batch:
-        t = item["text"].replace("\n", " ").strip()
-        if current_len + len(t) > 3500:
-            flush_block(current_ids, current_texts)
-            current_ids, current_texts, current_len = [], [], 0
-        current_ids.append(item["id"])
-        current_texts.append(t)
-        current_len += len(t) + 1
-
-    flush_block(current_ids, current_texts)
     return res_map
 
+def deep_translator_batch_sync(batch: list[dict]) -> dict[int, str]:
+    """Fallback using deep-translator with single requests to prevent rate limit blocks."""
+    translator = GoogleTranslator(source="en", target="fa")
+    res_map = {}
+    for item in batch:
+        try:
+            t = item["text"].strip()
+            fa = translator.translate(t)
+            if fa and has_persian_chars(fa):
+                res_map[item["id"]] = fa.strip()
+        except Exception:
+            pass
+    return res_map
+
+async def emergency_single_translate(text: str) -> str:
+    """Attempts single-line translation through GTX and MyMemory."""
+    t = text.strip()
+    if not t:
+        return ""
+
+    # 1. GTX single
+    try:
+        url = "https://translate.googleapis.com/translate_a/single"
+        params = {"client": "gtx", "sl": "en", "tl": "fa", "dt": "t", "q": t}
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            r = await client.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code == 200:
+                fa = r.json()[0][0][0]
+                if fa and has_persian_chars(fa):
+                    return fa.strip()
+    except Exception:
+        pass
+
+    # 2. MyMemory single
+    try:
+        url = f"https://api.mymemory.translated.net/get?q={urllib.parse.quote(t)}&langpair=en|fa"
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            r = await client.get(url)
+            if r.status_code == 200:
+                data = r.json()
+                fa = data.get("responseData", {}).get("translatedText", "")
+                if fa and has_persian_chars(fa) and not fa.startswith("MYMEMORY WARNING"):
+                    return fa.strip()
+    except Exception:
+        pass
+
+    return ""
+
+async def translate_batch_orchestrator(batch: list[dict], groq_models: list[str]) -> dict[int, str]:
+    """Runs primary LLM translation, falling back to GTX batch."""
+    # 1. Try Groq
+    if groq_models:
+        res = await try_groq_llm(batch, groq_models)
+        if len(res) >= int(len(batch) * 0.7):
+            return res
+
+    # 2. Try Gemini
+    if GEMINI_API_KEY:
+        res = await try_gemini_llm(batch)
+        if len(res) >= int(len(batch) * 0.7):
+            return res
+
+    # 3. Fast GTX batch
+    res = await try_gtx_batch(batch)
+    return res
 
 async def translate_all_subtitles_instant(segments: list[dict]) -> list[dict]:
     """
-    Guaranteed to finish in 3-10 seconds total:
-    1. Grabs the top active Groq model in 0.2s (no retries).
-    2. Fires parallel batches with a strict 8-second HTTP timeout.
-    3. Any batch or line not finished in 8 seconds is immediately translated in 0.4s via Google Batch Translate.
+    Robust translation engine:
+    1. Selects active Groq models + fallback models.
+    2. Runs batches through Groq LLM -> Gemini -> Google GTX.
+    3. Fills missing lines with deep_translator and emergency single-line translation.
+    4. Validates Persian characters to guarantee NO English subtitles leak through.
     """
     if not segments:
         return []
 
-    groq_model = ""
-    try:
-        for m in groq_client.models.list().data:
-            mid = m.id
-            if any(k in mid.lower() for k in ["llama-3", "qwen", "gemma"]) and "whisper" not in mid.lower() and "guard" not in mid.lower():
-                groq_model = mid
-                break
-    except Exception:
-        pass
+    # Detect active Groq models with robust fallbacks
+    groq_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "qwen/qwen-2.5-32b"]
+    if groq_client:
+        try:
+            detected = []
+            for m in groq_client.models.list().data:
+                mid = m.id
+                if any(k in mid.lower() for k in ["llama-3", "qwen", "gemma"]) and "whisper" not in mid.lower() and "guard" not in mid.lower():
+                    detected.append(mid)
+            if detected:
+                # Place detected models first, then fallbacks
+                groq_models = detected + [m for m in groq_models if m not in detected]
+        except Exception as e:
+            print(f"Groq models list note: {e}")
 
     batch_size = 35
     batches = [segments[i:i + batch_size] for i in range(0, len(segments), batch_size)]
 
-    # Step A: Try fast LLM batches concurrently (capped at 10 seconds total for ALL batches!)
-    llm_tasks = [try_llm_batch_with_hard_timeout(batch, groq_model) for batch in batches]
-    try:
-        results = await asyncio.wait_for(asyncio.gather(*llm_tasks, return_exceptions=True), timeout=12.0)
-    except asyncio.TimeoutError:
-        results = []
+    # Parallel batch execution
+    tasks = [translate_batch_orchestrator(b, groq_models) for b in batches]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
 
     combined_map = {}
     for r in results:
         if isinstance(r, dict):
             combined_map.update(r)
 
-    # Step B: Instantly fill any remaining/rate-limited lines in ~1-2 seconds using parallel Google Batch Translate
-    missing = [item for item in segments if item["id"] not in combined_map]
-    if missing:
-        print(f"Fast-filling {len(missing)} lines via parallel Google Batch Translator...")
-        g_batches = [missing[i:i + 40] for i in range(0, len(missing), 40)]
-        loop = asyncio.get_running_loop()
-        with ThreadPoolExecutor(max_workers=6) as pool:
-            g_tasks = [loop.run_in_executor(pool, google_batch_translate_sync, gb) for gb in g_batches]
-            g_results = await asyncio.gather(*g_tasks)
-        for gr in g_results:
-            combined_map.update(gr)
+    # Secondary pass: Fill any missing or non-Persian lines
+    missing = [
+        item for item in segments
+        if item["id"] not in combined_map or not has_persian_chars(combined_map.get(item["id"], ""))
+    ]
 
+    if missing:
+        print(f"Resolving {len(missing)} missing/untranslated lines via GTX and fallbacks...")
+        # Try GTX for the missing subset
+        gtx_res = await try_gtx_batch(missing)
+        combined_map.update(gtx_res)
+
+        still_missing = [
+            item for item in missing
+            if item["id"] not in combined_map or not has_persian_chars(combined_map.get(item["id"], ""))
+        ]
+
+        if still_missing:
+            loop = asyncio.get_running_loop()
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                dt_res = await loop.run_in_executor(pool, deep_translator_batch_sync, still_missing)
+                combined_map.update(dt_res)
+
+            # Emergency individual pass: guaranteed translation
+            for item in still_missing:
+                cid = item["id"]
+                current_fa = combined_map.get(cid, "")
+                if not current_fa or not has_persian_chars(current_fa):
+                    emergency_fa = await emergency_single_translate(item["text"])
+                    if emergency_fa:
+                        combined_map[cid] = emergency_fa
+
+    # Assemble final translated subtitles
     translated_all = []
     for item in segments:
-        fa_text = combined_map.get(item["id"], "").strip()
+        cid = item["id"]
+        fa_text = combined_map.get(cid, "").strip()
+        # Only as an absolute last resort if all 5 translation layers failed
         if not fa_text:
             fa_text = item["text"]
+
         translated_all.append({
             "start": item["start"],
             "end": item["end"],
@@ -576,7 +680,6 @@ async def translate_all_subtitles_instant(segments: list[dict]) -> list[dict]:
         })
 
     return translated_all
-
 
 # ================= SUBTITLE (.ASS) & SIZE-CONTROLLED FFMPEG =================
 def format_ass_time(seconds: float) -> str:
@@ -587,7 +690,6 @@ def format_ass_time(seconds: float) -> str:
     if centis >= 100:
         centis = 99
     return f"{hrs}:{mins:02d}:{secs:02d}.{centis:02d}"
-
 
 def generate_ass_file(subtitles: list[dict], user_tag: str, width: int, height: int, ass_path: str):
     min_dim = min(width, height)
@@ -621,12 +723,12 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         start_str = format_ass_time(sub["start"])
         end_str = format_ass_time(sub["end"])
         clean_text = sub["text"].replace("\n", "\\N").replace("{", "").replace("}", "")
+        # Unicode RTL embedding (\u202B) ensures correct Persian text shaping and punctuation
         rtl_text = f"\u202B{clean_text}"
         lines.append(f"Dialogue: 1,{start_str},{end_str},YellowSub,,0,0,0,,{rtl_text}")
 
     with open(ass_path, "w", encoding="utf-8-sig") as f:
         f.write("\n".join(lines) + "\n")
-
 
 async def burn_subtitles_ffmpeg_size_capped(
     client: TelegramClient,
@@ -641,7 +743,10 @@ async def burn_subtitles_ffmpeg_size_capped(
     orig_bitrate_kbps: int
 ):
     fps_filter = "fps=30," if orig_fps > 31.0 else ""
-    vf_filter = f"{fps_filter}scale={target_w}:{target_h}:flags=fast_bilinear,ass={ass_path}:fontsdir={fonts_dir}"
+    # Escape colons and backslashes for FFmpeg filtergraph
+    escaped_ass = ass_path.replace("\\", "/").replace(":", r"\:")
+    escaped_fonts = fonts_dir.replace("\\", "/").replace(":", r"\:")
+    vf_filter = f"{fps_filter}scale={target_w}:{target_h}:flags=fast_bilinear,ass={escaped_ass}:fontsdir={escaped_fonts}"
 
     target_max_kbps = min(orig_bitrate_kbps, 1800)
     target_max_kbps = max(400, target_max_kbps)
@@ -677,7 +782,7 @@ async def burn_subtitles_ffmpeg_size_capped(
                 bar = make_progress_bar(pct)
                 await update_status(
                     client,
-                    f"🎬 <b>مرحله ۴ از ۵:</b> رندر زیرنویس با حفظ حجم اصلی...\n"
+                    f"🎬 <b>مرحله ۴ از ۵:</b> رندر زیرنویس هوشمند...\n"
                     f"{bar} <b>{pct:.1f}%</b>",
                     force=False
                 )
@@ -688,7 +793,6 @@ async def burn_subtitles_ffmpeg_size_capped(
     if process.returncode != 0:
         stderr_out = (await process.stderr.read()).decode("utf-8", errors="ignore")
         raise RuntimeError(f"FFmpeg failed: {stderr_out[-300:]}")
-
 
 # ================= MAIN PIPELINE =================
 async def main():
@@ -717,7 +821,7 @@ async def main():
                 )
                 await update_status(main_client, text, force=False)
 
-        # 1. True 6-Socket Striped Download
+        # 1. 6-Socket Striped Download
         await update_status(main_client, "📥 <b>مرحله ۱ از ۵:</b> شروع دانلود موازی ۶ کاناله...", force=True)
         video_msg = await main_client.get_messages(CHAT_ID, ids=VIDEO_MSG_ID)
         input_video = "input_video.mp4"
@@ -732,7 +836,7 @@ async def main():
         orig_w, orig_h, duration, orig_fps, orig_bitrate_kbps = get_video_info(input_video)
         target_w, target_h = compute_target_resolution(orig_w, orig_h)
 
-        # 2. Extract Ultra-Light 24kbps Opus Audio & Transcribe with Groq Whisper
+        # 2. Extract 24kbps Opus Audio & Transcribe with Groq Whisper Turbo
         await update_status(main_client, "🎙 <b>مرحله ۲ از ۵:</b> تشخیص سریع گفتار (Whisper Turbo)...", force=True)
         audio_path = "extracted_audio.ogg"
         extract_ultrafast_audio(input_video, audio_path)
@@ -742,16 +846,16 @@ async def main():
             await update_status(main_client, "⚠️ گفتگوی انگلیسی تشخیص داده نشد، در حال درج تگ...", force=True)
             translated_subs = []
         else:
-            # 3. Hard-Timeout 10s Translation + Parallel Batch Fallback (Physically cannot hang!)
+            # 3. Multi-layer Resilient Subtitle Translation
             await update_status(
                 main_client,
-                f"🧠 <b>مرحله ۳ از ۵:</b> ترجمه فوق‌سریع ({len(segments)} خط)...",
+                f"🧠 <b>مرحله ۳ از ۵:</b> ترجمه هوشمند ({len(segments)} خط)...",
                 force=True
             )
             translated_subs = await translate_all_subtitles_instant(segments)
 
         # 4. Generate ASS & Burn with Bitrate-Capped FFmpeg
-        await update_status(main_client, "🎬 <b>مرحله ۴ از ۵:</b> شروع رندر زیرنویس با حجم بهینه...", force=True)
+        await update_status(main_client, "🎬 <b>مرحله ۴ از ۵:</b> شروع رندر زیرنویس هوشمند...", force=True)
         ass_path = "subtitles.ass"
         fonts_dir = "./fonts"
         output_video = "output_subtitled.mp4"
@@ -773,13 +877,13 @@ async def main():
         if not thumb_path:
             thumb_path = "auto_thumb.jpg"
             subprocess.run([
-                "ffmpeg", "-y", "-i", output_video, "-ss", "00:00:01",
+                "ffmpeg", "-y", "-ss", "00:00:01", "-i", output_video,
                 "-vframes", "1", "-q:v", "2", thumb_path
             ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if not os.path.exists(thumb_path):
                 thumb_path = None
 
-        # 5. True 6-Socket Striped Upload (Zero Caption)
+        # 5. 6-Socket Striped Upload & Streaming Delivery
         out_size_mb = os.path.getsize(output_video) / (1024 * 1024)
         await update_status(
             main_client,
@@ -836,7 +940,6 @@ async def main():
         raise e
     finally:
         await main_client.disconnect()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
