@@ -9,7 +9,8 @@ import asyncio
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 
-from telethon import TelegramClient
+from telethon import TelegramClient, utils
+from telethon.network import MTProtoSender
 from telethon.tl.types import (
     DocumentAttributeVideo,
     InputDocumentFileLocation,
@@ -20,6 +21,10 @@ from telethon.tl.functions.upload import (
     GetFileRequest,
     SaveFilePartRequest,
     SaveBigFilePartRequest,
+)
+from telethon.tl.functions.auth import (
+    ExportAuthorizationRequest,
+    ImportAuthorizationRequest,
 )
 
 from groq import Groq
@@ -70,34 +75,72 @@ def make_progress_bar(percent: float) -> str:
     return "🟩" * filled + "⬜" * (10 - filled)
 
 
-# ================= TRUE 6-SOCKET TCP CLIENT POOL =================
-async def create_client_pool(pool_size: int = 6) -> list[TelegramClient]:
-    async def init_single_client():
-        c = TelegramClient(None, API_ID, API_HASH, flood_sleep_threshold=60)
-        await c.start(bot_token=BOT_TOKEN)
-        return c
+# ================= FLOOD-FREE 6-SOCKET MTPROTO SENDER ENGINE =================
+async def create_sender_pool(client: TelegramClient, dc_id: int, pool_size: int = 6) -> list[MTProtoSender]:
+    """
+    Creates 6 raw MTProtoSender TCP connections WITHOUT calling sign_in(bot_token)!
+    - If on the same DC as the main client, it reuses client.session.auth_key directly (0 auth calls!).
+    - If on a different DC, it exports authorization once.
+    This gives 6-socket parallel speed while making FloodWait on ImportBotAuthorization impossible!
+    """
+    dc = await client._get_dc(dc_id)
+    senders = []
 
-    clients = await asyncio.gather(*(init_single_client() for _ in range(pool_size)))
-    return list(clients)
+    if dc_id == client.session.dc_id:
+        # Reuse the exact same auth_key across 6 independent TCP sockets (ZERO auth requests!)
+        for _ in range(pool_size):
+            sender = MTProtoSender(client.session.auth_key, loggers=client._log)
+            await sender.connect(
+                client._connection(
+                    dc.ip_address,
+                    dc.port,
+                    dc.id,
+                    loggers=client._log,
+                    proxy=client._proxy
+                )
+            )
+            senders.append(sender)
+    else:
+        # Cross-DC file transfer: export once to get DC auth_key, then clone across 6 sockets
+        first_sender = await client._borrow_exported_sender(dc_id)
+        shared_auth_key = first_sender.auth_key
+        await client._return_exported_sender(first_sender)
+
+        for _ in range(pool_size):
+            sender = MTProtoSender(shared_auth_key, loggers=client._log)
+            await sender.connect(
+                client._connection(
+                    dc.ip_address,
+                    dc.port,
+                    dc.id,
+                    loggers=client._log,
+                    proxy=client._proxy
+                )
+            )
+            senders.append(sender)
+
+    return senders
 
 
-async def disconnect_client_pool(clients: list[TelegramClient]):
-    await asyncio.gather(*(c.disconnect() for c in clients), return_exceptions=True)
+async def disconnect_sender_pool(senders: list[MTProtoSender]):
+    await asyncio.gather(*(s.disconnect() for s in senders), return_exceptions=True)
 
 
 async def striped_download_file(
-    clients: list[TelegramClient],
+    client: TelegramClient,
     media_message,
     output_path: str,
-    progress_callback=None
+    progress_callback=None,
+    pool_size: int = 6
 ):
     doc = media_message.document or media_message.video
     if not doc:
-        return await clients[0].download_media(media_message, file=output_path)
+        return await client.download_media(media_message, file=output_path)
 
     file_size = doc.size
     part_size = 512 * 1024  # 512 KB
     total_parts = math.ceil(file_size / part_size)
+    dc_id = doc.dc_id
 
     location = InputDocumentFileLocation(
         id=doc.id,
@@ -109,12 +152,14 @@ async def striped_download_file(
     fd = os.open(output_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
     os.ftruncate(fd, file_size)
 
+    senders = await create_sender_pool(client, dc_id, pool_size=pool_size)
+
     downloaded_bytes = 0
     queue = asyncio.Queue()
     for part_idx in range(total_parts):
         queue.put_nowait(part_idx)
 
-    async def worker_task(worker_client: TelegramClient):
+    async def worker_task(sender: MTProtoSender):
         nonlocal downloaded_bytes
         while not queue.empty():
             try:
@@ -125,11 +170,10 @@ async def striped_download_file(
             offset = part_idx * part_size
             for attempt in range(4):
                 try:
-                    res = await worker_client(GetFileRequest(
-                        location=location,
-                        offset=offset,
-                        limit=part_size
-                    ))
+                    res = await client._call(
+                        sender,
+                        GetFileRequest(location=location, offset=offset, limit=part_size)
+                    )
                     chunk = res.bytes
                     os.pwrite(fd, chunk, offset)
                     downloaded_bytes += len(chunk)
@@ -144,20 +188,22 @@ async def striped_download_file(
 
     try:
         tasks = []
-        for c in clients:
-            tasks.append(asyncio.create_task(worker_task(c)))
-            tasks.append(asyncio.create_task(worker_task(c)))
+        for s in senders:
+            tasks.append(asyncio.create_task(worker_task(s)))
+            tasks.append(asyncio.create_task(worker_task(s)))
         await asyncio.gather(*tasks)
     finally:
         os.close(fd)
+        await disconnect_sender_pool(senders)
 
     return output_path
 
 
 async def striped_upload_file(
-    clients: list[TelegramClient],
+    client: TelegramClient,
     file_path: str,
-    progress_callback=None
+    progress_callback=None,
+    pool_size: int = 6
 ):
     file_size = os.path.getsize(file_path)
     part_size = 512 * 1024  # 512 KB
@@ -172,12 +218,14 @@ async def striped_upload_file(
                 hash_md5.update(chunk)
 
     fd = os.open(file_path, os.O_RDONLY)
+    senders = await create_sender_pool(client, client.session.dc_id, pool_size=pool_size)
+
     uploaded_bytes = 0
     queue = asyncio.Queue()
     for part_idx in range(total_parts):
         queue.put_nowait(part_idx)
 
-    async def worker_task(worker_client: TelegramClient):
+    async def worker_task(sender: MTProtoSender):
         nonlocal uploaded_bytes
         while not queue.empty():
             try:
@@ -191,18 +239,19 @@ async def striped_upload_file(
             for attempt in range(4):
                 try:
                     if is_big:
-                        await worker_client(SaveBigFilePartRequest(
+                        req = SaveBigFilePartRequest(
                             file_id=file_id,
                             file_part=part_idx,
                             file_total_parts=total_parts,
                             bytes=chunk
-                        ))
+                        )
                     else:
-                        await worker_client(SaveFilePartRequest(
+                        req = SaveFilePartRequest(
                             file_id=file_id,
                             file_part=part_idx,
                             bytes=chunk
-                        ))
+                        )
+                    await client._call(sender, req)
                     uploaded_bytes += len(chunk)
                     if progress_callback:
                         await progress_callback(uploaded_bytes, file_size)
@@ -215,12 +264,13 @@ async def striped_upload_file(
 
     try:
         tasks = []
-        for c in clients:
-            tasks.append(asyncio.create_task(worker_task(c)))
-            tasks.append(asyncio.create_task(worker_task(c)))
+        for s in senders:
+            tasks.append(asyncio.create_task(worker_task(s)))
+            tasks.append(asyncio.create_task(worker_task(s)))
         await asyncio.gather(*tasks)
     finally:
         os.close(fd)
+        await disconnect_sender_pool(senders)
 
     file_name = os.path.basename(file_path)
     if is_big:
@@ -341,9 +391,6 @@ def transcribe_audio_fast(audio_path: str) -> list[dict]:
 
 # ================= BULLETPROOF LINE-BY-LINE TRANSLATION ENGINE =================
 def get_active_models_once() -> tuple[list[str], list[str]]:
-    """
-    Runs ONCE in 0.15 seconds to grab the exact model IDs active on your Groq & Gemini keys.
-    """
     groq_models = []
     try:
         for m in groq_client.models.list().data:
@@ -374,10 +421,6 @@ LINE_PARSE_REGEX = re.compile(r"^\[?(\d+)\]?\s*(?:\|\|\||[:\-–—])\s*(.+)$")
 
 
 def parse_delimited_lines(raw_output: str) -> dict[int, str]:
-    """
-    Parses 'ID|||Persian translation' lines.
-    Unlike JSON, if a single line has quotes or weird characters, it NEVER breaks the batch!
-    """
     res_map = {}
     if not raw_output:
         return res_map
@@ -406,11 +449,6 @@ def translate_chunk_delimited(
     groq_models: list[str],
     gemini_models: list[str]
 ) -> dict[int, str]:
-    """
-    Translates a 40-line batch using plain 'ID|||Persian' format.
-    - 2x faster than JSON
-    - 100% immune to JSON syntax crashes
-    """
     system_instruction = (
         "You are an elite Iranian subtitle translator. Translate every numbered English line into "
         "natural, fluent, conversational Persian (فارسی محاوره‌ای و طبیعی).\n"
@@ -425,8 +463,6 @@ def translate_chunk_delimited(
     )
 
     input_lines = "\n".join(f"{item['id']}|||{item['text']}" for item in batch)
-
-    # Alternate starting provider between Groq and Gemini across batches to double speed and avoid rate limits
     providers = ["groq", "gemini"] if (batch_idx % 2 == 0) else ["gemini", "groq"]
 
     for provider in providers:
@@ -442,7 +478,6 @@ def translate_chunk_delimited(
                         temperature=0.15
                     )
                     raw_text = resp.choices[0].message.content or ""
-                    # Strip <think>...</think> blocks if a reasoning model (like qwen/deepseek) was selected
                     raw_text = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL).strip()
                     parsed = parse_delimited_lines(raw_text)
                     if len(parsed) >= max(1, int(len(batch) * 0.6)):
@@ -496,7 +531,6 @@ async def translate_all_subtitles_instant(segments: list[dict]) -> list[dict]:
     for r in results:
         combined_map.update(r)
 
-    # Quick retry for any missing lines
     missing = [item for item in segments if item["id"] not in combined_map]
     if missing:
         print(f"Retrying {len(missing)} missed subtitle lines...")
@@ -511,7 +545,6 @@ async def translate_all_subtitles_instant(segments: list[dict]) -> list[dict]:
     for item in segments:
         fa_text = combined_map.get(item["id"], "").strip()
         if not fa_text:
-            # Fallback to original text rather than '...' if a single line ever fails
             fa_text = item["text"]
         translated_all.append({
             "start": item["start"],
@@ -636,8 +669,18 @@ async def burn_subtitles_ffmpeg_size_capped(
 
 # ================= MAIN PIPELINE =================
 async def main():
-    clients = await create_client_pool(pool_size=6)
-    main_client = clients[0]
+    os.makedirs("session_cache", exist_ok=True)
+    # Using a persistent session file keyed by the first 8 chars of BOT_TOKEN
+    token_hash = hashlib.md5(BOT_TOKEN.encode()).hexdigest()[:10]
+    session_path = f"session_cache/bot_{token_hash}"
+
+    main_client = TelegramClient(
+        session_path,
+        API_ID,
+        API_HASH,
+        flood_sleep_threshold=60
+    )
+    await main_client.start(bot_token=BOT_TOKEN)
 
     try:
         async def dl_progress(current, total):
@@ -652,11 +695,11 @@ async def main():
                 )
                 await update_status(main_client, text, force=False)
 
-        # 1. True 6-Socket Striped Download
+        # 1. True 6-Socket Striped Download (Uses MTProtoSenders, ZERO extra bot logins!)
         await update_status(main_client, "📥 <b>مرحله ۱ از ۵:</b> شروع دانلود موازی ۶ کاناله...", force=True)
         video_msg = await main_client.get_messages(CHAT_ID, ids=VIDEO_MSG_ID)
         input_video = "input_video.mp4"
-        await striped_download_file(clients, video_msg, input_video, progress_callback=dl_progress)
+        await striped_download_file(main_client, video_msg, input_video, progress_callback=dl_progress, pool_size=6)
 
         thumb_path = None
         if THUMB_MSG_ID and THUMB_MSG_ID > 0:
@@ -677,7 +720,7 @@ async def main():
             await update_status(main_client, "⚠️ گفتگوی انگلیسی تشخیص داده نشد، در حال درج تگ...", force=True)
             translated_subs = []
         else:
-            # 3. Direct Line-by-Line Translation (Immune to JSON errors & 404 model names)
+            # 3. Direct Line-by-Line Translation
             await update_status(
                 main_client,
                 f"🧠 <b>مرحله ۳ از ۵:</b> ترجمه آنی ({len(segments)} خط)...",
@@ -735,7 +778,7 @@ async def main():
                 await update_status(main_client, text, force=False)
 
         uploaded_input_file = await striped_upload_file(
-            clients, output_video, progress_callback=ul_progress
+            main_client, output_video, progress_callback=ul_progress, pool_size=6
         )
 
         await main_client.send_file(
@@ -770,7 +813,7 @@ async def main():
             pass
         raise e
     finally:
-        await disconnect_client_pool(clients)
+        await main_client.disconnect()
 
 
 if __name__ == "__main__":
