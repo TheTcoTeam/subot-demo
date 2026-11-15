@@ -1,7 +1,6 @@
 import os
 import json
 import html
-import time
 import asyncio
 import aiohttp
 from datetime import datetime
@@ -64,7 +63,7 @@ TAG_POS_LABELS = {
 TONE_ORDER = ["uncensored", "cinema"]
 TONE_LABELS = {
     "uncensored": "🔥 بزرگسال / بدون سانسور (محاوره‌ای)",
-    "cinema": "🎬 سینمایی عمومی (رسمی/طبیعی)",
+    "cinema": "🎬 سینمایی عمومی (طبیعی)",
 }
 
 
@@ -143,13 +142,13 @@ def get_session(user_id: int) -> dict:
             "sub_size": "normal",
             "tag_pos": "bottom",
             "tone": "uncensored",
-            "awaiting_input": None,  # "tag", "thumb", "admin_add_user", "admin_broadcast"
+            "awaiting_input": None,
             "is_dispatching": False,
         }
     return user_sessions[user_id]
 
 
-# ================= UI BUILDERS (RESTRICTED, STUDIO & ADMIN) =================
+# ================= UI BUILDERS =================
 def build_restricted_text(user) -> str:
     safe_name = html.escape(user.full_name or "کاربر گرامی")
     uid = user.id
@@ -429,7 +428,6 @@ async def handle_text(message: Message):
     uid = message.from_user.id
     session = get_session(uid)
 
-    # Admin interactive inputs
     if uid == OWNER_ID and session.get("awaiting_input") == "admin_add_user":
         raw_id = message.text.strip()
         if not raw_id.isdigit():
@@ -481,7 +479,7 @@ async def handle_text(message: Message):
         )
 
     if session.get("awaiting_input") == "tag":
-        new_tag = message.text.strip()[:40]
+        new_tag = message.text.strip().replace("__OPT__", "")[:40]
         if not new_tag:
             return await message.reply("⚠️ تگ نمی‌تواند خالی باشد. لطفاً متن تگ را ارسال کنید:")
         session["tag"] = new_tag
@@ -544,7 +542,6 @@ async def cb_request_access(call: CallbackQuery):
     except Exception:
         pass
 
-    # Notify Owner (@TahaTheGoat) immediately with one-click Approve/Reject buttons
     safe_name = html.escape(full_name)
     safe_uname = html.escape(username)
     owner_alert = (
@@ -608,7 +605,6 @@ async def cb_adm_approve(call: CallbackQuery):
     except Exception:
         pass
 
-    # Notify the newly approved user immediately
     try:
         await bot.send_message(
             target_uid,
@@ -804,7 +800,6 @@ async def cb_open_studio_prefs(call: CallbackQuery):
 
 @dp.callback_query(F.data == "show_help")
 async def cb_show_help(call: CallbackQuery):
-    uid = call.from_user.id
     help_text = (
         "📖 <b>راهنمای استودیو هوشمند زیرنویس (نسخه توربو پرو)</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
@@ -939,14 +934,11 @@ async def cb_start_render(call: CallbackQuery):
     session["is_dispatching"] = True
     video_msg_id = session["video_msg_id"]
     thumb_msg_id = session["thumb_msg_id"] or 0
-    user_tag = session["tag"]
-    render_options = json.dumps({
-        "color": session.get("sub_color", "yellow"),
-        "size": session.get("sub_size", "normal"),
-        "tag_pos": session.get("tag_pos", "bottom"),
-        "tone": session.get("tone", "uncensored"),
-        "dispatch_ts": time.time(),
-    })
+
+    # Pack studio options into user_tag so GitHub's 5-input workflow never throws HTTP 422!
+    clean_tag = session["tag"].replace("__OPT__", "").strip()
+    opt_suffix = f"{session.get('sub_color', 'yellow')},{session.get('sub_size', 'normal')},{session.get('tag_pos', 'bottom')},{session.get('tone', 'uncensored')}"
+    packed_user_tag = f"{clean_tag}__OPT__{opt_suffix}"
 
     await call.answer("🚀 در حال ارسال به سرور پردازش توربو...")
     status_msg = await call.message.edit_text(
@@ -961,8 +953,7 @@ async def cb_start_render(call: CallbackQuery):
         status_msg_id=status_msg.message_id,
         video_msg_id=video_msg_id,
         thumb_msg_id=thumb_msg_id,
-        user_tag=user_tag,
-        render_options=render_options
+        user_tag=packed_user_tag
     )
 
     session["is_dispatching"] = False
@@ -988,8 +979,7 @@ async def trigger_github_workflow(
     status_msg_id: int,
     video_msg_id: int,
     thumb_msg_id: int,
-    user_tag: str,
-    render_options: str = ""
+    user_tag: str
 ) -> bool:
     global http_client
     url = f"https://api.github.com/repos/{GH_OWNER}/{GH_REPO}/actions/workflows/process_video.yml/dispatches"
@@ -1005,8 +995,7 @@ async def trigger_github_workflow(
             "status_msg_id": str(status_msg_id),
             "video_msg_id": str(video_msg_id),
             "thumb_msg_id": str(thumb_msg_id),
-            "user_tag": user_tag,
-            "render_options": render_options
+            "user_tag": user_tag
         }
     }
     try:
