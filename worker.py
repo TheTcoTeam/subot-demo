@@ -46,33 +46,34 @@ CHAT_ID = int((os.getenv("CHAT_ID") or "0").strip())
 STATUS_MSG_ID = int((os.getenv("STATUS_MSG_ID") or "0").strip())
 VIDEO_MSG_ID = int((os.getenv("VIDEO_MSG_ID") or "0").strip())
 THUMB_MSG_ID = int((os.getenv("THUMB_MSG_ID") or "0").strip())
-USER_TAG = (os.getenv("USER_TAG") or "@YourChannelTag").strip()
-RAW_RENDER_OPTIONS = (os.getenv("RENDER_OPTIONS") or "").strip()
+RAW_USER_TAG = (os.getenv("USER_TAG") or "@YourChannelTag").strip()
 
 
-def parse_render_options(raw_str: str) -> dict:
-    defaults = {
+def unpack_user_tag_and_options(raw_tag: str) -> tuple[str, dict]:
+    opts = {
         "color": "yellow",
         "size": "normal",
         "tag_pos": "bottom",
         "tone": "uncensored",
-        "dispatch_ts": 0.0,
     }
-    if not raw_str:
-        return defaults
-    try:
-        parsed = json.loads(raw_str)
-        if isinstance(parsed, dict):
-            defaults.update(parsed)
-    except Exception:
-        pass
-    return defaults
+    if "__OPT__" not in raw_tag:
+        return raw_tag, opts
+    clean_tag, opt_part = raw_tag.split("__OPT__", 1)
+    parts = [p.strip() for p in opt_part.split(",")]
+    if len(parts) >= 1 and parts[0]:
+        opts["color"] = parts[0]
+    if len(parts) >= 2 and parts[1]:
+        opts["size"] = parts[1]
+    if len(parts) >= 3 and parts[2]:
+        opts["tag_pos"] = parts[2]
+    if len(parts) >= 4 and parts[3]:
+        opts["tone"] = parts[3]
+    return (clean_tag.strip() or "@YourChannelTag"), opts
 
 
-RENDER_OPTS = parse_render_options(RAW_RENDER_OPTIONS)
+USER_TAG, RENDER_OPTS = unpack_user_tag_and_options(RAW_USER_TAG)
 
 groq_client = Groq(api_key=GROQ_API_KEY, max_retries=1, timeout=30.0) if GROQ_API_KEY else None
-
 last_edit_time = 0.0
 
 
@@ -635,11 +636,10 @@ MULTI_SPACE_REGEX = re.compile(r"\s+")
 
 
 def has_persian_chars(text: str) -> bool:
-    """Returns True if the string contains any Persian/Arabic script characters."""
     return bool(PERSIAN_CHAR_REGEX.search(text))
 
 
-# O(1) Hash-Map of 180+ Erotic, Intimate & Colloquial Dialogues (Executes in < 0.0005 seconds)
+# O(1) Hash-Map of 180+ Erotic, Intimate & Colloquial Dialogues (Executes in < 0.0005s)
 DIRECT_PHRASES = {
     # Climax & Orgasm
     "i'm coming": "داره میاد",
@@ -836,16 +836,13 @@ DIRECT_PHRASES = {
     "come here": "بیا اینجا",
 }
 
-# Sorted longest-first for fast substring phrase matching
 SORTED_DIRECT_KEYS = sorted(
     [(k, v) for k, v in DIRECT_PHRASES.items() if len(k) >= 8],
     key=lambda x: len(x[0]),
     reverse=True
 )
 
-# Pre-compiled Regex Patterns for 0ms Colloquial Persian Refinement
 RAW_REPLACEMENTS = [
-    # Climax / Cum
     (r"(?:من\s+)?دارم\s+می[\s\u200c]*آیم", "داره میاد"),
     (r"(?:من\s+)?دارم\s+میام", "داره میاد"),
     (r"(?:من\s+)?می[\s\u200c]*خوام\s+بیام", "داره آبم میاد"),
@@ -854,8 +851,6 @@ RAW_REPLACEMENTS = [
     (r"ارگاسم", "ارضا شدن"),
     (r"منی\s+من", "آبم"),
     (r"منی\s+خود\s+را", "آبتو"),
-
-    # Exclamations
     (r"اوه\s+بله", "آره جونم"),
     (r"اوه\s+آره", "آخ آره"),
     (r"بله\s+کودک", "آره عشقم"),
@@ -864,8 +859,6 @@ RAW_REPLACEMENTS = [
     (r"بله\s+بابا", "آره ددی جون"),
     (r"اوه\s+خدای\s+من", "وای خدا"),
     (r"خدای\s+لعنتی\s+من", "وای خدای من"),
-
-    # Fuck / Fucking
     (r"مرا\s+لعنت\s+کن(?:ید)?", "بکن منو"),
     (r"لعنت\s+به\s+من", "بکن منو"),
     (r"من\s+را\s+بکن", "بکن منو"),
@@ -876,22 +869,16 @@ RAW_REPLACEMENTS = [
     (r"لعنتی\s+عالی", "دیوونه‌کننده"),
     (r"فاک\s+می", "بکن منو"),
     (r"فاک", "لعنتی"),
-
-    # Intensity & Speed
     (r"سخت[\s\u200c]*تر", "محکم‌تر"),
     (r"سریع[\s\u200c]*تر", "تندتر"),
     (r"عمیق[\s\u200c]*تر", "تا ته"),
     (r"آهسته[\s\u200c]*تر", "آروم‌تر"),
     (r"تا\s+انتها", "تا تهش"),
-
-    # Don't stop / Keep going
     (r"متوقف\s+نشو(?:ید)?", "وای نستا"),
     (r"توقف\s+نکن(?:ید)?", "ول نکن"),
     (r"ایست\s+نکن", "ادامه بده"),
     (r"آن\s*را\s+بیرون\s+نکش(?:ید)?", "درش نیار"),
     (r"بیرون\s+نکش", "درش نیار"),
-
-    # Pleasure & Questions
     (r"(?:آیا\s+)?(?:آن\s*را|اینو)\s+دوست\s+داری", "خوشت میاد؟"),
     (r"دوستش\s+داری\؟?", "حال می‌کنی؟"),
     (r"اینو\s+می[\s\u200c]*خواهی", "اینو می‌خوای؟"),
@@ -901,8 +888,6 @@ RAW_REPLACEMENTS = [
     (r"خیلی\s+خوب\s+احساس\s+می[\s\u200c]*شه", "وای چه کیفی داره"),
     (r"مزه\s+بسیار\s+خوبی\s+دارد", "خیلی خوشمزه‌ست"),
     (r"طعم\s+خوبی\s+دارد", "مزه عالی میده"),
-
-    # Imperatives & Positions
     (r"به\s+من\s+نگاه\s+کن(?:ید)?", "نگام کن"),
     (r"به\s+اینجا\s+بیا(?:یید)?", "بیا اینجا"),
     (r"بیا\s+این[\s\u200c]*جا", "بیا اینجا"),
@@ -922,8 +907,6 @@ RAW_REPLACEMENTS = [
     (r"فشار\s+بده\s+داخل", "بکنش تو"),
     (r"پاهای\s+خود\s+را\s+باز\s+کن(?:ید)?", "پاهاتو باز کن"),
     (r"روی\s+زانوهای\s+خود", "رو زانوهات"),
-
-    # Anatomy & Slang Fixes
     (r"گربه\s*(?:من|ات|ت)?", "کصم"),
     (r"واژن\s*(?:من|ات|ت)?", "کصم"),
     (r"خروس\s*(?:من|ات|ت)?", "کیرم"),
@@ -949,17 +932,12 @@ def clean_for_lookup(text: str) -> str:
 
 
 def match_direct_phrase(text: str) -> str:
-    """
-    Ultra-fast O(1) dictionary lookup + clause composer.
-    Matches single and multi-clause intimate sentences in < 0.2ms without network overhead.
-    """
     cleaned = clean_for_lookup(text)
     if not cleaned:
         return ""
     if cleaned in DIRECT_PHRASES:
         return DIRECT_PHRASES[cleaned]
 
-    # Try splitting compound clauses (e.g. "Oh fuck, don't stop, I'm coming!")
     clauses = [clean_for_lookup(c) for c in re.split(r"[,!.?;]+", text) if c.strip()]
     if len(clauses) > 1:
         matched_parts = []
@@ -967,7 +945,6 @@ def match_direct_phrase(text: str) -> str:
             if c in DIRECT_PHRASES:
                 matched_parts.append(DIRECT_PHRASES[c])
             else:
-                # Strip filler vocatives like "baby" or "please" at edges
                 c_trimmed = re.sub(r"\b(baby|babe|please|now|right now)\b", "", c).strip()
                 c_trimmed = MULTI_SPACE_REGEX.sub(" ", c_trimmed)
                 if c_trimmed in DIRECT_PHRASES:
@@ -982,9 +959,6 @@ def match_direct_phrase(text: str) -> str:
 
 
 def refine_colloquial_persian(text: str) -> str:
-    """
-    Polishes machine translations into authentic, natural colloquial Persian using pre-compiled regexes.
-    """
     if not text:
         return ""
     t = text.strip()
@@ -1135,7 +1109,6 @@ async def translate_all_subtitles_instant(segments: list[dict], tone: str = "unc
 
     combined_map = {}
 
-    # Step 0: Instant O(1) Direct Phrase Matching (0 ms)
     remaining_segments = []
     for item in segments:
         direct = match_direct_phrase(item["text"]) if tone != "cinema" else ""
@@ -1145,7 +1118,6 @@ async def translate_all_subtitles_instant(segments: list[dict], tone: str = "unc
             remaining_segments.append(item)
 
     async with httpx.AsyncClient(timeout=7.0) as shared_client:
-        # Step 1: Fast Parallel LLM on remaining segments
         if remaining_segments:
             batch_size = 15
             sem = asyncio.Semaphore(4)
@@ -1159,7 +1131,6 @@ async def translate_all_subtitles_instant(segments: list[dict], tone: str = "unc
             except Exception:
                 pass
 
-        # Step 2: Instant Google GTX fallback for any missing lines
         missing = [
             item for item in segments
             if item["id"] not in combined_map or not has_persian_chars(combined_map.get(item["id"], ""))
@@ -1196,7 +1167,6 @@ async def translate_all_subtitles_instant(segments: list[dict], tone: str = "unc
             except Exception as e:
                 print(f"GTX fallback note: {e}", flush=True)
 
-    # Step 3: Fast translate_batch fallback from deep_translator if anything is still missing
     still_missing = [
         item for item in segments
         if item["id"] not in combined_map or not has_persian_chars(combined_map.get(item["id"], ""))
@@ -1256,4 +1226,220 @@ def format_ass_time(seconds: float) -> str:
     hrs = int(seconds // 3600)
     mins = int((seconds % 3600) // 60)
     secs = int(seconds % 60)
-    centis = int(round((seconds - int(seconds)) * 1
+    centis = int(round((seconds - int(seconds)) * 100))
+    if centis >= 100:
+        centis = 99
+    return f"{hrs}:{mins:02d}:{secs:02d}.{centis:02d}"
+
+
+def generate_ass_file(
+    subtitles: list[dict],
+    user_tag: str,
+    width: int,
+    height: int,
+    ass_path: str,
+    options: dict | None = None
+):
+    opts = options or RENDER_OPTS
+    color_code = ASS_COLOR_MAP.get(opts.get("color", "yellow"), "&H0000FFFF")
+    size_mult = SIZE_MULTIPLIER_MAP.get(opts.get("size", "normal"), 1.0)
+    tag_pos = opts.get("tag_pos", "bottom")
+
+    min_dim = min(width, height)
+    sub_font_size = max(22, int(min_dim * 0.046 * size_mult))
+    tag_font_size = max(18, int(min_dim * 0.032))
+    sub_margin_v = int(height * 0.085)
+    outline_size = max(2, int(sub_font_size * 0.08))
+
+    tag_align, tag_margin_ratio = TAG_ALIGNMENT_MAP.get(tag_pos, (2, 0.022))
+    tag_margin_v = int(height * tag_margin_ratio)
+
+    ass_header = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {width}
+PlayResY: {height}
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: YellowSub,Vazirmatn,{sub_font_size},{color_code},&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,{outline_size},1,2,40,40,{sub_margin_v},1
+Style: BottomTag,Vazirmatn,{tag_font_size},&H30FFFFFF,&H000000FF,&H00000000,&H60000000,-1,0,0,0,100,100,0,0,1,2,1,{tag_align},28,28,{tag_margin_v},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+    lines = [ass_header.strip()]
+
+    if tag_pos != "none" and user_tag:
+        clean_tag = user_tag.replace("\n", " ").replace("{", "").replace("}", "")
+        lines.append(f"Dialogue: 0,0:00:00.00,9:59:59.00,BottomTag,,0,0,0,,{clean_tag}")
+
+    for sub in subtitles:
+        start_str = format_ass_time(sub["start"])
+        end_str = format_ass_time(sub["end"])
+        clean_text = sub["text"].replace("\n", "\\N").replace("{", "").replace("}", "")
+        rtl_text = f"\u202B{clean_text}"
+        lines.append(f"Dialogue: 1,{start_str},{end_str},YellowSub,,0,0,0,,{rtl_text}")
+
+    with open(ass_path, "w", encoding="utf-8-sig") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+async def burn_subtitles_ffmpeg_size_capped(
+    client: TelegramClient,
+    input_video: str,
+    ass_path: str,
+    fonts_dir: str,
+    output_video: str,
+    target_w: int,
+    target_h: int,
+    orig_w: int,
+    orig_h: int,
+    total_duration: int,
+    orig_fps: float,
+    orig_bitrate_kbps: int
+):
+    fps_filter = "fps=30," if orig_fps > 30.5 else ""
+    scale_filter = f"scale={target_w}:{target_h}:flags=fast_bilinear," if (target_w != orig_w or target_h != orig_h) else ""
+
+    escaped_ass = ass_path.replace("\\", "/").replace(":", r"\:")
+    escaped_fonts = fonts_dir.replace("\\", "/").replace(":", r"\:")
+    vf_filter = f"{fps_filter}{scale_filter}ass={escaped_ass}:fontsdir={escaped_fonts}"
+
+    is_1080p_or_higher = max(target_w, target_h) >= 1920 or min(target_w, target_h) >= 1080
+    if is_1080p_or_higher:
+        target_max_kbps = min(orig_bitrate_kbps, 6000)
+        target_max_kbps = max(2200, target_max_kbps)
+        crf_val = "23"
+    else:
+        target_max_kbps = min(orig_bitrate_kbps, 3000)
+        target_max_kbps = max(800, target_max_kbps)
+        crf_val = "24"
+
+    bufsize_kbps = target_max_kbps * 2
+
+    def _build_ffmpeg_cmd(audio_codec_args: list[str]) -> list[str]:
+        return [
+            "ffmpeg", "-y", "-nostdin",
+            "-threads", "0",
+            "-thread_type", "slice+frame",
+            "-i", input_video,
+            "-vf", vf_filter,
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-tune", "fastdecode",
+            "-crf", crf_val,
+            "-maxrate", f"{target_max_kbps}k",
+            "-bufsize", f"{bufsize_kbps}k",
+            "-pix_fmt", "yuv420p",
+            *audio_codec_args,
+            "-movflags", "+faststart",
+            "-progress", "pipe:1",
+            "-nostats",
+            output_video
+        ]
+
+    for attempt_idx, audio_args in enumerate((["-c:a", "copy"], ["-c:a", "aac", "-b:a", "128k"])):
+        cmd = _build_ffmpeg_cmd(audio_args)
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        while True:
+            line = await process.stdout.readline()
+            if not line:
+                break
+            line_str = line.decode("utf-8", errors="ignore").strip()
+            if line_str.startswith("out_time_ms=") and total_duration > 0:
+                try:
+                    ms = int(line_str.split("=")[1])
+                    current_sec = ms / 1_000_000.0
+                    pct = min(99.0, max(0.0, (current_sec / total_duration) * 100.0))
+                    bar = make_progress_bar(pct)
+                    await update_status(
+                        client,
+                        f"🎬 <b>مرحله ۴ از ۵:</b> رندر توربو زیرنویس...\n"
+                        f"{bar} <b>{pct:.1f}%</b>",
+                        force=False
+                    )
+                except Exception:
+                    pass
+
+        await process.wait()
+        if process.returncode == 0:
+            return
+        if attempt_idx == 1:
+            stderr_out = (await process.stderr.read()).decode("utf-8", errors="ignore")
+            raise RuntimeError(f"FFmpeg failed: {stderr_out[-300:]}")
+        print("[WORKER] FFmpeg -c:a copy incompatible with source audio, retrying with AAC...", flush=True)
+
+
+# ================= RESILIENT MTPROTO CLIENT STARTUP =================
+async def start_bot_client_safely(session_path: str) -> TelegramClient:
+    for attempt in range(2):
+        client = TelegramClient(
+            session_path,
+            API_ID,
+            API_HASH,
+            flood_sleep_threshold=60
+        )
+        try:
+            await client.start(bot_token=BOT_TOKEN)
+            return client
+        except (AuthKeyDuplicatedError, AuthKeyUnregisteredError, AuthKeyError, Exception) as e:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            if attempt == 0:
+                print(f"[WORKER] Cached session issue ({e}), resetting session file...", flush=True)
+                for f in glob.glob(f"{session_path}*"):
+                    try:
+                        os.remove(f)
+                    except Exception:
+                        pass
+            else:
+                raise e
+
+
+# ================= MAIN PIPELINE =================
+async def main():
+    t_job_start = time.time()
+    os.makedirs("session_cache", exist_ok=True)
+    token_hash = hashlib.md5(BOT_TOKEN.encode()).hexdigest()[:10]
+    session_path = f"session_cache/bot_{token_hash}"
+
+    main_client = await start_bot_client_safely(session_path)
+
+    try:
+        async def dl_progress(current, total):
+            if total > 0:
+                pct = min(100.0, (current / total) * 100.0)
+                mb_cur = current / (1024 * 1024)
+                mb_tot = total / (1024 * 1024)
+                bar = make_progress_bar(pct)
+                text = (
+                    f"📥 <b>مرحله ۱ از ۵:</b> دانلود ۶ کاناله توربو...\n"
+                    f"{bar} <b>{pct:.1f}%</b> (<code>{mb_cur:.1f} / {mb_tot:.1f} MB</code>)"
+                )
+                await update_status(main_client, text, force=False)
+
+        # 1. 6-Socket Striped Download
+        t0_dl = time.time()
+        await update_status(main_client, "📥 <b>مرحله ۱ از ۵:</b> شروع دانلود موازی ۶ کاناله...", force=True)
+        video_msg = await main_client.get_messages(CHAT_ID, ids=VIDEO_MSG_ID)
+        if not video_msg:
+            raise RuntimeError("ویدیوی مورد نظر یافت نشد (ممکن است حذف شده باشد).")
+
+        input_video = "input_video.mp4"
+        await striped_download_file(main_client, video_msg, input_video, progress_callback=dl_progress, pool_size=6)
+        dl_elapsed = time.time() - t0_dl
+
+        thumb_path = None
+        if THUMB_MSG_ID and THUMB_MSG_ID > 0:
+            thumb_msg = await main_client.get_messages(CHAT_ID, ids=THUMB_MSG_ID)
+            if thumb_msg and thumb_msg.photo:
+                thumb_path = await main_client.
