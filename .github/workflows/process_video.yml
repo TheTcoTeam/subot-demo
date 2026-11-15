@@ -35,12 +35,15 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Cache Telegram MTProto Session (Prevents FloodWait)
+      - name: Cache Telegram MTProto Session & Persian Font
         uses: actions/cache@v4
         with:
-          path: session_cache
-          key: tg-bot-session-${{ github.run_id }}
+          path: |
+            session_cache
+            fonts
+          key: tg-bot-assets-${{ github.run_id }}
           restore-keys: |
+            tg-bot-assets-
             tg-bot-session-
 
       - name: Fast Install FFmpeg, Font & Dependencies
@@ -51,10 +54,10 @@ jobs:
             sudo apt-get install -y -qq --no-install-recommends ffmpeg libass9
           fi
           if [ ! -s fonts/Vazirmatn-Bold.ttf ]; then
-            wget -q -O fonts/Vazirmatn-Bold.ttf https://github.com/rastikerdar/vazirmatn/raw/master/fonts/ttf/Vazirmatn-Bold.ttf || \
-            wget -q -O fonts/Vazirmatn-Bold.ttf https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/fonts/ttf/Vazirmatn-Bold.ttf
+            wget -q -O fonts/Vazirmatn-Bold.ttf https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/fonts/ttf/Vazirmatn-Bold.ttf || \
+            wget -q -O fonts/Vazirmatn-Bold.ttf https://raw.githubusercontent.com/rastikerdar/vazirmatn/v33.003/fonts/ttf/Vazirmatn-Bold.ttf
           fi
-          pip install -q -r requirements.txt
+          pip install -q --prefer-binary -r requirements.txt
 
       - name: Run Video Subtitle Worker
         env:
